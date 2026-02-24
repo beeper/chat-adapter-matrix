@@ -606,4 +606,100 @@ describe("MatrixAdapter", () => {
       deviceID: "DEVICE2",
     });
   });
+
+  it("uses loginRequest for password login and forwards deviceID", async () => {
+    const loginRequest = vi.fn(async () => ({
+      access_token: "fresh-token",
+      user_id: "@bot:beeper.com",
+      device_id: "DEVICE2",
+    }));
+    const loginWithPassword = vi.fn(async () => {
+      throw new Error("should not use loginWithPassword");
+    });
+
+    const adapter = new MatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: {
+        type: "password",
+        username: "bot",
+        password: "secret",
+      },
+      deviceID: "DEVICE1",
+      createBootstrapClient: () =>
+        ({
+          loginRequest,
+          loginWithPassword,
+          whoami: vi.fn(),
+        }) as never,
+    });
+
+    (adapter as unknown as { stateAdapter: unknown }).stateAdapter =
+      makeStateAdapter() as unknown;
+    const resolved = await (
+      adapter as unknown as {
+        resolveAuth: () => Promise<{
+          accessToken: string;
+          userID: string;
+          deviceID?: string;
+        }>;
+      }
+    ).resolveAuth();
+
+    expect(loginRequest).toHaveBeenCalledOnce();
+    expect(loginRequest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        device_id: "DEVICE1",
+        identifier: { type: "m.id.user", user: "bot" },
+        password: "secret",
+        type: "m.login.password",
+        user: "bot",
+      })
+    );
+    expect(loginWithPassword).not.toHaveBeenCalled();
+    expect(resolved).toMatchObject({
+      accessToken: "fresh-token",
+      userID: "@bot:beeper.com",
+      deviceID: "DEVICE2",
+    });
+  });
+
+  it("uses whoami device_id for access token auth", async () => {
+    const whoami = vi.fn(async () => ({
+      user_id: "@bot:beeper.com",
+      device_id: "DEVICE_FROM_WHOAMI",
+    }));
+
+    const adapter = new MatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: {
+        type: "accessToken",
+        accessToken: "token",
+      },
+      deviceID: "DEVICE_FALLBACK",
+      createBootstrapClient: () =>
+        ({
+          whoami,
+          loginWithPassword: vi.fn(),
+        }) as never,
+    });
+
+    (adapter as unknown as { stateAdapter: unknown }).stateAdapter =
+      makeStateAdapter() as unknown;
+    const resolved = await (
+      adapter as unknown as {
+        resolveAuth: () => Promise<{
+          accessToken: string;
+          userID: string;
+          deviceID?: string;
+        }>;
+      }
+    ).resolveAuth();
+
+    expect(whoami).toHaveBeenCalledOnce();
+    expect(resolved).toMatchObject({
+      accessToken: "token",
+      userID: "@bot:beeper.com",
+      deviceID: "DEVICE_FROM_WHOAMI",
+    });
+  });
 });

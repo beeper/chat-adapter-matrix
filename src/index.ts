@@ -36,6 +36,7 @@ import sdk, {
   RoomEvent,
 } from "matrix-js-sdk";
 import { decodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key";
+import { logger as matrixSDKLogger } from "matrix-js-sdk/lib/logger";
 import type {
   MatrixAuthBootstrapClient,
   MatrixAccessTokenAuthConfig,
@@ -55,6 +56,14 @@ const FAST_SYNC_DEFAULTS: NonNullable<MatrixAdapterConfig["sync"]> = {
   disablePresence: true,
   pollTimeout: 10_000,
 };
+const MATRIX_SDK_LOG_LEVELS: Record<string, number> = {
+  trace: 0,
+  debug: 1,
+  info: 2,
+  warn: 3,
+  error: 4,
+};
+let matrixSDKLogConfigured = false;
 
 type MatrixMessageContent = {
   body?: string;
@@ -111,6 +120,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   private readonly createBootstrapClientFn?: MatrixAdapterConfig["createBootstrapClient"];
   private readonly e2eeConfig?: MatrixAdapterConfig["e2ee"];
   private readonly recoveryKey?: string;
+  private readonly matrixSDKLogLevel?: MatrixAdapterConfig["matrixSDKLogLevel"];
   private readonly deviceIDPersistence: DeviceIDPersistenceConfig;
   private readonly loggerProvided: boolean;
   private readonly sessionConfig: Required<
@@ -160,6 +170,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
         config.e2ee?.storagePassword ?? config.recoveryKey,
     };
     this.recoveryKey = normalizeOptionalString(config.recoveryKey);
+    this.matrixSDKLogLevel = config.matrixSDKLogLevel;
     this.deviceIDPersistence = {
       enabled: config.deviceIDPersistence?.enabled ?? true,
       key: normalizeOptionalString(config.deviceIDPersistence?.key),
@@ -185,6 +196,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       this.logger = chat.getLogger("matrix");
     }
     this.stateAdapter = chat.getState();
+    this.configureMatrixSDKLogging();
     await this.resolveDeviceID();
 
     if (this.createClientFn) {
@@ -562,11 +574,12 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
 
   private async resolveAuth(): Promise<ResolvedAuth> {
     if (this.auth.type === "accessToken") {
-      const userID = this.auth.userID ?? (await this.lookupUserIDFromAccessToken(this.auth.accessToken));
+      const whoami = await this.lookupWhoAmIFromAccessToken(this.auth.accessToken);
+      const userID = this.auth.userID ?? whoami.userID;
       const resolved: ResolvedAuth = {
         accessToken: this.auth.accessToken,
         userID,
-        deviceID: this.deviceID,
+        deviceID: whoami.deviceID ?? this.deviceID,
       };
       await this.persistDeviceIDForResolvedUser(userID);
       await this.persistSession(resolved);
@@ -596,10 +609,22 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     }
 
     const bootstrapClient = this.createBootstrapClient();
-    const loginResponse = await bootstrapClient.loginWithPassword(
-      this.auth.username,
-      this.auth.password
-    );
+    const loginResponse = bootstrapClient.loginRequest
+      ? await bootstrapClient.loginRequest({
+          type: "m.login.password",
+          password: this.auth.password,
+          identifier: {
+            type: "m.id.user",
+            user: this.auth.username,
+          },
+          user: this.auth.username,
+          device_id: this.deviceID,
+          initial_device_display_name: this.auth.initialDeviceDisplayName,
+        })
+      : await bootstrapClient.loginWithPassword(
+          this.auth.username,
+          this.auth.password
+        );
 
     const userID = this.auth.userID ?? loginResponse.user_id;
     if (!userID) {
@@ -609,7 +634,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     const resolved: ResolvedAuth = {
       accessToken: loginResponse.access_token,
       userID,
-      deviceID: this.deviceID ?? loginResponse.device_id ?? undefined,
+      deviceID: loginResponse.device_id ?? this.deviceID ?? undefined,
     };
     await this.persistDeviceIDForResolvedUser(resolved.userID, resolved.deviceID);
     await this.persistSession(resolved);
@@ -1428,6 +1453,28 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       await this.stateAdapter.delete(temporaryKey);
     }
   }
+
+  private configureMatrixSDKLogging(): void {
+    if (matrixSDKLogConfigured) {
+      return;
+    }
+
+    const requestedLevel = this.matrixSDKLogLevel;
+    if (!requestedLevel) {
+      return;
+    }
+
+    const numericLevel = MATRIX_SDK_LOG_LEVELS[requestedLevel];
+    if (numericLevel === undefined) {
+      return;
+    }
+
+    const loggerWithSetLevel = matrixSDKLogger as unknown as {
+      setLevel?: (level: number, persist?: boolean) => void;
+    };
+    loggerWithSetLevel.setLevel?.(numericLevel, false);
+    matrixSDKLogConfigured = true;
+  }
 }
 
 export function createMatrixAdapter(config: MatrixAdapterConfig): MatrixAdapter;
@@ -1480,6 +1527,8 @@ export function createMatrixAdapter(config?: MatrixAdapterConfig): MatrixAdapter
       key: process.env.MATRIX_SESSION_KEY,
       ttlMs: parseEnvNumber(process.env.MATRIX_SESSION_TTL_MS),
     },
+    matrixSDKLogLevel:
+      parseSDKLogLevel(process.env.MATRIX_SDK_LOG_LEVEL) ?? "error",
   });
 }
 
@@ -1581,4 +1630,23 @@ function normalizeOptionalString(value: string | undefined): string | undefined 
 
 function hasIndexedDB(): boolean {
   return typeof globalThis.indexedDB !== "undefined" && globalThis.indexedDB !== null;
+}
+
+function parseSDKLogLevel(
+  value: string | undefined
+): MatrixAdapterConfig["matrixSDKLogLevel"] | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const normalized = value.trim().toLowerCase();
+  if (
+    normalized === "trace" ||
+    normalized === "debug" ||
+    normalized === "info" ||
+    normalized === "warn" ||
+    normalized === "error"
+  ) {
+    return normalized;
+  }
+  return undefined;
 }

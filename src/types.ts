@@ -39,6 +39,7 @@ export interface MatrixAdapterConfig {
   deviceID?: string;
   e2ee?: MatrixE2EEConfig;
   logger?: Logger;
+  matrixSDKLogLevel?: "trace" | "debug" | "info" | "warn" | "error";
   recoveryKey?: string;
   roomAllowlist?: string[];
   session?: MatrixSessionConfig;
@@ -65,6 +66,21 @@ export interface MatrixDeviceIDPersistenceConfig {
 }
 
 export interface MatrixAuthBootstrapClient {
+  loginRequest?: (data: {
+    type: "m.login.password";
+    password: string;
+    identifier?: {
+      type: "m.id.user";
+      user: string;
+    };
+    user?: string;
+    device_id?: string;
+    initial_device_display_name?: string;
+  }) => Promise<{
+    access_token: string;
+    device_id?: string;
+    user_id?: string;
+  }>;
   loginWithPassword: (
     username: string,
     password: string
