@@ -35,6 +35,7 @@ import sdk, {
   RelationType,
   RoomEvent,
 } from "matrix-js-sdk";
+import { decodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key";
 import type {
   MatrixAuthBootstrapClient,
   MatrixAccessTokenAuthConfig,
@@ -97,6 +98,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   private readonly createClientFn?: MatrixAdapterConfig["createClient"];
   private readonly createBootstrapClientFn?: MatrixAdapterConfig["createBootstrapClient"];
   private readonly e2eeConfig?: MatrixAdapterConfig["e2ee"];
+  private readonly recoveryKey?: string;
   private readonly sessionConfig: Required<
     Pick<NonNullable<MatrixAdapterConfig["session"]>, "enabled">
   > &
@@ -141,6 +143,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       storagePassword:
         config.e2ee?.storagePassword ?? config.recoveryKey,
     };
+    this.recoveryKey = normalizeOptionalString(config.recoveryKey);
     this.sessionConfig = {
       decrypt: config.session?.decrypt,
       enabled: config.session?.enabled ?? true,
@@ -601,11 +604,22 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   }
 
   private buildClient(auth: ResolvedAuth): MatrixClient {
+    const cryptoCallbacks =
+      this.recoveryKey && this.e2eeConfig?.enabled
+        ? {
+            getSecretStorageKey: async (
+              opts: { keys: Record<string, unknown> },
+              _name: string
+            ) => this.getSecretStorageKeyFromRecoveryKey(opts),
+          }
+        : undefined;
+
     return sdk.createClient({
       baseUrl: this.baseURL,
       accessToken: auth.accessToken,
       userId: auth.userID,
       deviceId: auth.deviceID,
+      cryptoCallbacks,
     });
   }
 
@@ -675,11 +689,34 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       storagePassword: this.e2eeConfig.storagePassword,
       storageKey: this.e2eeConfig.storageKey,
     });
+    await this.maybeLoadKeyBackupFromRecoveryKey();
 
     this.logger.info("Matrix E2EE initialized", {
       useIndexedDB: useIndexedDB !== false,
       cryptoDatabasePrefix: this.e2eeConfig.cryptoDatabasePrefix,
     });
+  }
+
+  private async maybeLoadKeyBackupFromRecoveryKey(): Promise<void> {
+    if (!this.recoveryKey) {
+      return;
+    }
+
+    const crypto = this.requireClient().getCrypto();
+    if (!crypto) {
+      return;
+    }
+
+    try {
+      await crypto.loadSessionBackupPrivateKeyFromSecretStorage();
+      await crypto.checkKeyBackupAndEnable();
+      this.logger.info("Loaded Matrix key backup using recovery key");
+    } catch (error) {
+      this.logger.warn(
+        "Failed to load Matrix key backup from recovery key. E2EE will run, but historical key restore may be unavailable.",
+        { error: String(error) }
+      );
+    }
   }
 
   private async tryDecryptEvent(event: MatrixEvent): Promise<void> {
@@ -1188,6 +1225,23 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       typeof session.baseURL === "string" &&
       session.baseURL === this.baseURL
     );
+  }
+
+  private getSecretStorageKeyFromRecoveryKey(
+    opts: { keys: Record<string, unknown> }
+  ): [string, Uint8Array<ArrayBuffer>] | null {
+    if (!this.recoveryKey) {
+      return null;
+    }
+
+    const keyIDs = Object.keys(opts.keys ?? {});
+    const keyID = keyIDs[0];
+    if (!keyID) {
+      return null;
+    }
+
+    const privateKey = decodeRecoveryKey(this.recoveryKey);
+    return [keyID, privateKey];
   }
 
   private validateConfig(config: MatrixAdapterConfig): void {

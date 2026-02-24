@@ -60,6 +60,7 @@ auth: { type: "password", username: process.env.MATRIX_USERNAME!, password: proc
 - Slash command parsing from text messages (default `/` prefix)
 - Outbound post/edit/delete/reaction/typing support
 - E2EE support (Rust crypto + inbound decrypt)
+- Recovery-key-based key-backup loading during E2EE init
 - Auto-generated `deviceID` when none is provided
 - Session persistence via Chat state adapter
 - Sample event payloads in [`sample-messages.md`](./sample-messages.md)
@@ -100,6 +101,7 @@ bun --env-file=examples/.env run examples/bot.ts
 - `handleWebhook()` returns `501` by design (Matrix uses sync polling).
 - Session durability depends on your Chat state backend (use Redis in production).
 - If `session.encrypt` is set, `session.decrypt` is also required.
+- With `MATRIX_RECOVERY_KEY`, adapter provides secret-storage key callbacks and attempts key-backup activation.
 
 ## Shutdown
 

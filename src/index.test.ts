@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { getEmoji } from "chat";
 import { EventType, RelationType } from "matrix-js-sdk";
+import { encodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key";
 import { createMatrixAdapter, MatrixAdapter } from "./index";
 
 function makeEvent(overrides: Record<string, unknown> = {}) {
@@ -297,6 +298,35 @@ describe("MatrixAdapter", () => {
     }) as unknown as { e2eeConfig?: { enabled?: boolean } };
 
     expect(adapter.e2eeConfig?.enabled).toBe(true);
+  });
+
+  it("decodes recovery key for secret storage callback", () => {
+    const recoveryKey = encodeRecoveryKey(new Uint8Array(32).fill(7));
+    expect(recoveryKey).toBeDefined();
+
+    const adapter = createMatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: {
+        type: "accessToken",
+        accessToken: "token",
+        userID: "@bot:beeper.com",
+      },
+      recoveryKey: recoveryKey!,
+    }) as unknown as {
+      getSecretStorageKeyFromRecoveryKey: (opts: {
+        keys: Record<string, unknown>;
+      }) => [string, Uint8Array] | null;
+    };
+
+    const result = adapter.getSecretStorageKeyFromRecoveryKey({
+      keys: {
+        key1: {},
+      },
+    });
+
+    expect(result).not.toBeNull();
+    expect(result?.[0]).toBe("key1");
+    expect(result?.[1]).toBeInstanceOf(Uint8Array);
   });
 
   it("generates a device id when one is not provided", () => {
