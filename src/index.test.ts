@@ -310,7 +310,7 @@ describe("MatrixAdapter", () => {
     }) as unknown as { deviceID?: string };
 
     expect(adapter.deviceID).toBeDefined();
-    expect(adapter.deviceID).toMatch(/^bbctl_[A-Z0-9]{8}$/);
+    expect(adapter.deviceID).toMatch(/^chatsdk_[A-Z0-9]{8}$/);
   });
 
   it("supports typed username/password auth config", () => {
