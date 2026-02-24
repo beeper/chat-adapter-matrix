@@ -2,3 +2,9 @@ node_modules
 dist
 coverage
 *.log
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example

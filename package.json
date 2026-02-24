@@ -18,12 +18,17 @@
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
+    "example:bun": "bun --env-file=examples/.env run examples/bot.ts",
+    "example:bun:redis": "bun --env-file=examples/.env run examples/bot.redis.ts",
+    "clean:repo": "rm -rf dist coverage",
     "test": "vitest run --coverage",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist"
   },
   "dependencies": {
+    "@chat-adapter/state-memory": "^4.13.4",
+    "@chat-adapter/state-redis": "^4.13.4",
     "chat": "^4.13.4",
     "matrix-js-sdk": "^41.0.0"
   },

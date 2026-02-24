@@ -15,6 +15,7 @@ import type {
   ThreadInfo,
   ThreadSummary,
   WebhookOptions,
+  StateAdapter,
 } from "chat";
 import {
   ConsoleLogger,
@@ -35,6 +36,7 @@ import sdk, {
   RoomEvent,
 } from "matrix-js-sdk";
 import type {
+  MatrixAuthBootstrapClient,
   MatrixAccessTokenAuthConfig,
   MatrixAdapterConfig,
   MatrixAuthConfig,
@@ -42,6 +44,7 @@ import type {
 } from "./types";
 
 const MATRIX_PREFIX = "matrix";
+const MATRIX_SESSION_PREFIX = "matrix:session";
 const DEFAULT_COMMAND_PREFIX = "/";
 const TYPING_TIMEOUT_MS = 30_000;
 
@@ -68,6 +71,20 @@ type ResolvedAuth = {
   userID: string;
 };
 
+type StoredSession = {
+  accessToken?: string;
+  authType: MatrixAuthConfig["type"];
+  baseURL: string;
+  createdAt: string;
+  deviceID?: string;
+  e2eeEnabled: boolean;
+  encryptedPayload?: string;
+  recoveryKeyPresent: boolean;
+  updatedAt: string;
+  userID: string;
+  username?: string;
+};
+
 export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   readonly name = "matrix";
   readonly userName: string;
@@ -78,10 +95,19 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   private readonly roomAllowlist?: Set<string>;
   private readonly syncOptions?: MatrixAdapterConfig["sync"];
   private readonly createClientFn?: MatrixAdapterConfig["createClient"];
+  private readonly createBootstrapClientFn?: MatrixAdapterConfig["createBootstrapClient"];
   private readonly e2eeConfig?: MatrixAdapterConfig["e2ee"];
+  private readonly sessionConfig: Required<
+    Pick<NonNullable<MatrixAdapterConfig["session"]>, "enabled">
+  > &
+    Pick<
+      NonNullable<MatrixAdapterConfig["session"]>,
+      "decrypt" | "encrypt" | "key" | "ttlMs"
+    >;
 
   private readonly logger: Logger;
   private chat: ChatInstance | null = null;
+  private stateAdapter: StateAdapter | null = null;
   private client: MatrixClient | null = null;
   private started = false;
   private userID: string;
@@ -89,15 +115,16 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   private botUserID?: string;
   private readonly reactionByEventID = new Map<string, StoredReaction>();
   private readonly myReactionByKey = new Map<string, string>();
-
-  get botUserId(): string | undefined {
-    return this.botUserID;
-  }
+  private shuttingDown = false;
 
   constructor(config: MatrixAdapterConfig) {
+    this.validateConfig(config);
     this.baseURL = config.baseURL;
     this.auth = config.auth;
-    this.userID = config.auth.type === "accessToken" ? config.auth.userID : (config.auth.userID ?? "");
+    this.userID =
+      config.auth.type === "accessToken"
+        ? (config.auth.userID ?? "")
+        : (config.auth.userID ?? "");
     this.botUserID = this.userID || undefined;
     this.deviceID = config.deviceID;
     this.userName = config.userName ?? "bot";
@@ -107,11 +134,19 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       : undefined;
     this.syncOptions = config.sync;
     this.createClientFn = config.createClient;
+    this.createBootstrapClientFn = config.createBootstrapClient;
     this.e2eeConfig = {
       ...config.e2ee,
       enabled: config.e2ee?.enabled ?? Boolean(config.recoveryKey),
       storagePassword:
         config.e2ee?.storagePassword ?? config.recoveryKey,
+    };
+    this.sessionConfig = {
+      decrypt: config.session?.decrypt,
+      enabled: config.session?.enabled ?? true,
+      encrypt: config.session?.encrypt,
+      key: config.session?.key,
+      ttlMs: config.session?.ttlMs,
     };
     this.logger = config.logger ?? new ConsoleLogger("info").child("matrix");
   }
@@ -122,6 +157,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     }
 
     this.chat = chat;
+    this.stateAdapter = chat.getState();
 
     if (this.createClientFn) {
       this.client = this.createClientFn();
@@ -149,6 +185,27 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       userID: this.userID,
       baseURL: this.baseURL,
     });
+  }
+
+  get botUserId(): string | undefined {
+    return this.botUserID;
+  }
+
+  async shutdown(): Promise<void> {
+    if (!this.client || this.shuttingDown) {
+      return;
+    }
+
+    this.shuttingDown = true;
+    try {
+      this.client.stopClient();
+      this.reactionByEventID.clear();
+      this.myReactionByKey.clear();
+      this.started = false;
+      this.logger.info("Matrix adapter shutdown complete");
+    } finally {
+      this.shuttingDown = false;
+    }
   }
 
   async handleWebhook(
@@ -468,14 +525,38 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
 
   private async resolveAuth(): Promise<ResolvedAuth> {
     if (this.auth.type === "accessToken") {
-      return {
+      const userID = this.auth.userID ?? (await this.lookupUserIDFromAccessToken(this.auth.accessToken));
+      const resolved: ResolvedAuth = {
         accessToken: this.auth.accessToken,
-        userID: this.auth.userID,
+        userID,
         deviceID: this.deviceID,
       };
+      await this.persistSession(resolved);
+      return resolved;
     }
 
-    const bootstrapClient = sdk.createClient({ baseUrl: this.baseURL });
+    const restored = await this.loadPersistedSession();
+    if (restored?.accessToken) {
+      try {
+        const whoami = await this.lookupWhoAmIFromAccessToken(restored.accessToken);
+        const resolved: ResolvedAuth = {
+          accessToken: restored.accessToken,
+          userID: whoami.userID,
+          deviceID: this.deviceID ?? whoami.deviceID ?? restored.deviceID,
+        };
+        await this.persistSession(resolved);
+        this.logger.info("Reused persisted Matrix session", {
+          userID: resolved.userID,
+        });
+        return resolved;
+      } catch (error) {
+        this.logger.warn("Persisted Matrix session is invalid. Falling back to password login.", {
+          error: String(error),
+        });
+      }
+    }
+
+    const bootstrapClient = this.createBootstrapClient();
     const loginResponse = await bootstrapClient.loginWithPassword(
       this.auth.username,
       this.auth.password
@@ -486,11 +567,37 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       throw new Error("Password login succeeded but no user ID was returned.");
     }
 
-    return {
+    const resolved: ResolvedAuth = {
       accessToken: loginResponse.access_token,
       userID,
       deviceID: this.deviceID ?? loginResponse.device_id ?? undefined,
     };
+    await this.persistSession(resolved);
+    return resolved;
+  }
+
+  private async lookupUserIDFromAccessToken(accessToken: string): Promise<string> {
+    const whoami = await this.lookupWhoAmIFromAccessToken(accessToken);
+    return whoami.userID;
+  }
+
+  private async lookupWhoAmIFromAccessToken(
+    accessToken: string
+  ): Promise<{ deviceID?: string; userID: string }> {
+    const bootstrapClient = this.createBootstrapClient({
+      accessToken,
+      deviceID: this.deviceID,
+    });
+    const whoami = await bootstrapClient.whoami();
+    const userID = whoami.user_id;
+    const deviceID =
+      typeof whoami.device_id === "string" ? whoami.device_id : undefined;
+
+    if (!userID) {
+      throw new Error("Access token whoami lookup did not return user_id.");
+    }
+
+    return { userID, deviceID };
   }
 
   private buildClient(auth: ResolvedAuth): MatrixClient {
@@ -500,6 +607,25 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       userId: auth.userID,
       deviceId: auth.deviceID,
     });
+  }
+
+  private createBootstrapClient(args?: {
+    accessToken?: string;
+    deviceID?: string;
+  }): MatrixAuthBootstrapClient {
+    if (this.createBootstrapClientFn) {
+      return this.createBootstrapClientFn({
+        baseURL: this.baseURL,
+        accessToken: args?.accessToken,
+        deviceID: args?.deviceID,
+      });
+    }
+
+    return sdk.createClient({
+      baseUrl: this.baseURL,
+      accessToken: args?.accessToken,
+      deviceId: args?.deviceID,
+    }) as MatrixAuthBootstrapClient;
   }
 
   private sendRoomMessage(
@@ -895,6 +1021,145 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   ): string {
     return `${threadId}::${messageId}::${rawEmoji}`;
   }
+
+  private getSessionStorageKeys(userID?: string): string[] {
+    if (this.sessionConfig.key) {
+      return [this.sessionConfig.key];
+    }
+
+    const basePrefix = `${MATRIX_SESSION_PREFIX}:${encodeURIComponent(this.baseURL)}`;
+    const keys = new Set<string>();
+
+    if (userID) {
+      keys.add(`${basePrefix}:user:${encodeURIComponent(userID)}`);
+    }
+
+    if (this.auth.type === "password") {
+      keys.add(`${basePrefix}:username:${encodeURIComponent(this.auth.username)}`);
+    }
+
+    return Array.from(keys);
+  }
+
+  private async loadPersistedSession(): Promise<StoredSession | null> {
+    if (!this.sessionConfig.enabled || !this.stateAdapter) {
+      return null;
+    }
+
+    const keys = this.getSessionStorageKeys(this.auth.userID);
+    for (const key of keys) {
+      const raw = await this.stateAdapter.get<StoredSession>(key);
+      const session = this.decodeStoredSession(raw);
+      if (this.isValidStoredSession(session)) {
+        return session;
+      }
+    }
+
+    return null;
+  }
+
+  private async persistSession(auth: ResolvedAuth): Promise<void> {
+    if (!this.sessionConfig.enabled || !this.stateAdapter) {
+      return;
+    }
+
+    const now = new Date().toISOString();
+    const existing = await this.loadPersistedSession();
+    const session: StoredSession = {
+      accessToken: auth.accessToken,
+      authType: this.auth.type,
+      baseURL: this.baseURL,
+      createdAt: existing?.createdAt ?? now,
+      deviceID: auth.deviceID,
+      e2eeEnabled: Boolean(this.e2eeConfig?.enabled),
+      recoveryKeyPresent: Boolean(this.e2eeConfig?.storagePassword),
+      updatedAt: now,
+      userID: auth.userID,
+      username: this.auth.type === "password" ? this.auth.username : undefined,
+    };
+    const encodedSession = this.encodeStoredSession(session);
+
+    const keys = this.getSessionStorageKeys(auth.userID);
+    await Promise.all(
+      keys.map((key) =>
+        this.stateAdapter!.set(key, encodedSession, this.sessionConfig.ttlMs)
+      )
+    );
+  }
+
+  private encodeStoredSession(session: StoredSession): StoredSession {
+    if (!this.sessionConfig.encrypt) {
+      return session;
+    }
+
+    const encryptedPayload = this.sessionConfig.encrypt(JSON.stringify(session));
+    return {
+      authType: session.authType,
+      baseURL: session.baseURL,
+      createdAt: session.createdAt,
+      deviceID: session.deviceID,
+      e2eeEnabled: session.e2eeEnabled,
+      encryptedPayload,
+      recoveryKeyPresent: session.recoveryKeyPresent,
+      updatedAt: session.updatedAt,
+      userID: session.userID,
+      username: session.username,
+    };
+  }
+
+  private decodeStoredSession(
+    session: StoredSession | null
+  ): StoredSession | null {
+    if (!session || !session.encryptedPayload) {
+      return session;
+    }
+
+    if (!this.sessionConfig.decrypt) {
+      return null;
+    }
+
+    try {
+      const decryptedJSON = this.sessionConfig.decrypt(session.encryptedPayload);
+      const parsed = JSON.parse(decryptedJSON) as StoredSession;
+      return parsed;
+    } catch (error) {
+      this.logger.warn("Failed to decrypt persisted Matrix session", {
+        error: String(error),
+      });
+      return null;
+    }
+  }
+
+  private isValidStoredSession(value: unknown): value is StoredSession {
+    if (!value || typeof value !== "object") {
+      return false;
+    }
+
+    const session = value as Partial<StoredSession>;
+    return (
+      typeof session.accessToken === "string" &&
+      typeof session.userID === "string" &&
+      typeof session.baseURL === "string" &&
+      session.baseURL === this.baseURL
+    );
+  }
+
+  private validateConfig(config: MatrixAdapterConfig): void {
+    if (!config.baseURL?.trim()) {
+      throw new Error("baseURL is required.");
+    }
+    if (config.session?.ttlMs !== undefined && config.session.ttlMs <= 0) {
+      throw new Error("session.ttlMs must be a positive number.");
+    }
+    if (
+      (config.session?.encrypt && !config.session?.decrypt) ||
+      (!config.session?.encrypt && config.session?.decrypt)
+    ) {
+      throw new Error(
+        "session.encrypt and session.decrypt must be provided together."
+      );
+    }
+  }
 }
 
 export function createMatrixAdapter(config: MatrixAdapterConfig): MatrixAdapter;
@@ -934,6 +1199,11 @@ export function createMatrixAdapter(config?: MatrixAdapterConfig): MatrixAdapter
         "MATRIX_E2EE_STORAGE_KEY_BASE64"
       ),
     },
+    session: {
+      enabled: envBool(process.env.MATRIX_SESSION_ENABLED, true),
+      key: process.env.MATRIX_SESSION_KEY,
+      ttlMs: parseEnvNumber(process.env.MATRIX_SESSION_TTL_MS),
+    },
   });
 }
 
@@ -955,9 +1225,9 @@ function resolveAuthFromEnv(): MatrixAuthConfig {
   const accessToken = process.env.MATRIX_ACCESS_TOKEN;
   const userID = process.env.MATRIX_USER_ID;
 
-  if (!accessToken || !userID) {
+  if (!accessToken) {
     throw new Error(
-      "Set MATRIX_USERNAME+MATRIX_PASSWORD for password auth, or MATRIX_ACCESS_TOKEN+MATRIX_USER_ID for access token auth."
+      "Set MATRIX_USERNAME+MATRIX_PASSWORD for password auth, or MATRIX_ACCESS_TOKEN for access token auth."
     );
   }
 
@@ -998,6 +1268,19 @@ function decodeBase64(
   }
 
   return bytes;
+}
+
+function parseEnvNumber(value: string | undefined): number | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`Expected a positive number, got: ${value}`);
+  }
+
+  return parsed;
 }
 
 function generateDeviceID(length = 10): string {

@@ -8,7 +8,7 @@ Matrix adapter for [Chat SDK](https://chat-sdk.dev/docs).
 npm install chat @beeper/chat-adapter-matrix matrix-js-sdk
 ```
 
-## Usage
+## Quick Start
 
 ```ts
 import { Chat } from "chat";
@@ -24,10 +24,10 @@ const bot = new Chat({
       auth: {
         type: "accessToken",
         accessToken: process.env.MATRIX_ACCESS_TOKEN!,
-        userID: process.env.MATRIX_USER_ID!,
+        userID: process.env.MATRIX_USER_ID,
       },
       recoveryKey: process.env.MATRIX_RECOVERY_KEY,
-      commandPrefix: "/"
+      commandPrefix: "/",
     }),
   },
 });
@@ -42,36 +42,70 @@ bot.onSlashCommand("/ping", async (event) => {
 });
 ```
 
+## Auth Modes
+
+- Access token:
+```ts
+auth: { type: "accessToken", accessToken: process.env.MATRIX_ACCESS_TOKEN! }
+```
+- Username/password:
+```ts
+auth: { type: "password", username: process.env.MATRIX_USERNAME!, password: process.env.MATRIX_PASSWORD! }
+```
+
 ## Features
 
 - Matrix sync-based inbound event ingestion (no webhook dependency)
-- Mention-aware message forwarding to Chat SDK
+- Message, mention, slash command, and reaction mapping
 - Slash command parsing from text messages (default `/` prefix)
-- Reaction add/remove mapping (`m.reaction` + redactions)
-- Thread ID encoding for room-level and Matrix thread messages
-- Outbound post, edit (replace relation), delete, typing, and reactions
-- Optional E2EE support (Rust crypto init + inbound decryption)
+- Outbound post/edit/delete/reaction/typing support
+- E2EE support (Rust crypto + inbound decrypt)
 - Auto-generated `deviceID` when none is provided
-- Typed auth modes: access token or username/password
+- Session persistence via Chat state adapter
+- Sample event payloads in [`sample-messages.md`](./sample-messages.md)
 
-## Environment Variables
+## Environment
 
 - `MATRIX_BASE_URL`
-- `MATRIX_ACCESS_TOKEN` + `MATRIX_USER_ID` for access-token auth
-- `MATRIX_USERNAME` + `MATRIX_PASSWORD` for username/password auth
+- Access token mode: `MATRIX_ACCESS_TOKEN` (`MATRIX_USER_ID` optional)
+- Password mode: `MATRIX_USERNAME`, `MATRIX_PASSWORD` (`MATRIX_USER_ID` optional)
 - `MATRIX_DEVICE_ID` (optional)
-- `MATRIX_E2EE_ENABLED` (`true`/`false`)
+- `MATRIX_RECOVERY_KEY` (enables E2EE when present)
+- `MATRIX_E2EE_ENABLED` (`true`/`false`, optional override)
 - `MATRIX_E2EE_USE_INDEXEDDB` (`true`/`false`, default `true`)
 - `MATRIX_E2EE_DB_PREFIX` (optional)
 - `MATRIX_E2EE_STORAGE_PASSWORD` (optional)
-- `MATRIX_E2EE_STORAGE_KEY_BASE64` (optional; 32-byte key recommended)
-- `MATRIX_RECOVERY_KEY` (if set, E2EE is enabled automatically)
+- `MATRIX_E2EE_STORAGE_KEY_BASE64` (optional)
+- `MATRIX_SESSION_ENABLED` (`true`/`false`, default `true`)
+- `MATRIX_SESSION_KEY` (optional)
+- `MATRIX_SESSION_TTL_MS` (optional)
 
-## Limitations
+## Examples
 
-- `handleWebhook()` intentionally returns `501`; Matrix transport is sync/poll driven
-- `removeReaction()` redacts only reactions sent by this adapter instance and tracked locally
-- If `MATRIX_DEVICE_ID` is not set, a device ID is generated automatically
+Copy [`examples/.env.example`](./examples/.env.example) to `examples/.env`, then run:
+
+```bash
+npm run example:bun
+npm run example:bun:redis
+```
+
+## Notes
+
+- `handleWebhook()` returns `501` by design (Matrix uses sync polling).
+- Session durability depends on your Chat state backend (use Redis in production).
+- If `session.encrypt` is set, `session.decrypt` is also required.
+
+## Shutdown
+
+Stop sync cleanly on process exit:
+
+```ts
+const matrix = createMatrixAdapter();
+process.on("SIGINT", async () => {
+  await matrix.shutdown();
+  process.exit(0);
+});
+```
 
 ## License
 

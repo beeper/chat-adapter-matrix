@@ -6,9 +6,9 @@ import { createMatrixAdapter, MatrixAdapter } from "./index";
 function makeEvent(overrides: Record<string, unknown> = {}) {
   const event = {
     getId: () => "$event",
-    getRoomId: () => "!room:example.com",
+    getRoomId: () => "!room:beeper.com",
     getTs: () => 1_700_000_000_000,
-    getSender: () => "@alice:example.com",
+    getSender: () => "@alice:beeper.com",
     getType: () => EventType.RoomMessage,
     getContent: () => ({ body: "hello" }),
     getRelation: () => null,
@@ -30,6 +30,7 @@ function makeClient() {
       handlers.set(eventName, cb);
     },
     startClient: vi.fn(async () => undefined),
+    stopClient: vi.fn(() => undefined),
     sendMessage: vi.fn(async () => ({ event_id: "$sent" })),
     sendEvent: vi.fn(async () => ({ event_id: "$reaction" })),
     redactEvent: vi.fn(async () => ({ event_id: "$redaction" })),
@@ -37,7 +38,7 @@ function makeClient() {
     initRustCrypto: vi.fn(async () => undefined),
     decryptEventIfNeeded: vi.fn(async () => undefined),
     getRoom: vi.fn(() => ({
-      roomId: "!room:example.com",
+      roomId: "!room:beeper.com",
       name: "Example Room",
       timeline: [],
       getJoinedMembers: () => [{}, {}],
@@ -49,26 +50,47 @@ function makeClient() {
   return client;
 }
 
+function makeStateAdapter(initial: Record<string, unknown> = {}) {
+  const store = new Map<string, unknown>(Object.entries(initial));
+  return {
+    acquireLock: vi.fn(async () => null),
+    connect: vi.fn(async () => undefined),
+    delete: vi.fn(async (key: string) => {
+      store.delete(key);
+    }),
+    disconnect: vi.fn(async () => undefined),
+    extendLock: vi.fn(async () => false),
+    get: vi.fn(async (key: string) => (store.has(key) ? store.get(key) : null)),
+    isSubscribed: vi.fn(async () => false),
+    releaseLock: vi.fn(async () => undefined),
+    set: vi.fn(async (key: string, value: unknown) => {
+      store.set(key, value);
+    }),
+    subscribe: vi.fn(async () => undefined),
+    unsubscribe: vi.fn(async () => undefined),
+  };
+}
+
 describe("MatrixAdapter", () => {
   it("encodes and decodes thread IDs", () => {
     const adapter = new MatrixAdapter({
-      baseURL: "https://hs.example.com",
+      baseURL: "https://hs.beeper.com",
       auth: {
         type: "accessToken",
         accessToken: "token",
-        userID: "@bot:example.com",
+        userID: "@bot:beeper.com",
       },
     });
 
     const encoded = adapter.encodeThreadId({
-      roomID: "!room:example.com",
-      rootEventID: "$root:example.com",
+      roomID: "!room:beeper.com",
+      rootEventID: "$root:beeper.com",
     });
 
-    expect(encoded).toBe("matrix:!room%3Aexample.com:%24root%3Aexample.com");
+    expect(encoded).toBe("matrix:!room%3Abeeper.com:%24root%3Abeeper.com");
     expect(adapter.decodeThreadId(encoded)).toEqual({
-      roomID: "!room:example.com",
-      rootEventID: "$root:example.com",
+      roomID: "!room:beeper.com",
+      rootEventID: "$root:beeper.com",
     });
   });
 
@@ -76,11 +98,11 @@ describe("MatrixAdapter", () => {
     const fakeClient = makeClient();
 
     const adapter = new MatrixAdapter({
-      baseURL: "https://hs.example.com",
+      baseURL: "https://hs.beeper.com",
       auth: {
         type: "accessToken",
         accessToken: "token",
-        userID: "@bot:example.com",
+        userID: "@bot:beeper.com",
       },
       createClient: () => fakeClient as never,
     });
@@ -118,7 +140,7 @@ describe("MatrixAdapter", () => {
         getId: () => "$cmd",
         getContent: () => ({ body: "/ping hi" }),
       }),
-      { roomId: "!room:example.com" },
+      { roomId: "!room:beeper.com" },
       false
     );
     await Promise.resolve();
@@ -136,11 +158,11 @@ describe("MatrixAdapter", () => {
     const processReaction = vi.fn();
 
     const adapter = new MatrixAdapter({
-      baseURL: "https://hs.example.com",
+      baseURL: "https://hs.beeper.com",
       auth: {
         type: "accessToken",
         accessToken: "token",
-        userID: "@bot:example.com",
+        userID: "@bot:beeper.com",
       },
       createClient: () => fakeClient as never,
     });
@@ -181,7 +203,7 @@ describe("MatrixAdapter", () => {
           },
         }),
       }),
-      { roomId: "!room:example.com" },
+      { roomId: "!room:beeper.com" },
       false
     );
 
@@ -191,7 +213,7 @@ describe("MatrixAdapter", () => {
         isRedaction: () => true,
         getAssociatedId: () => "$reaction1",
       }),
-      { roomId: "!room:example.com" },
+      { roomId: "!room:beeper.com" },
       false
     );
     await Promise.resolve();
@@ -214,11 +236,11 @@ describe("MatrixAdapter", () => {
     const processMessage = vi.fn();
 
     const adapter = new MatrixAdapter({
-      baseURL: "https://hs.example.com",
+      baseURL: "https://hs.beeper.com",
       auth: {
         type: "accessToken",
         accessToken: "token",
-        userID: "@bot:example.com",
+        userID: "@bot:beeper.com",
       },
       deviceID: "DEVICE1",
       createClient: () => fakeClient as never,
@@ -255,7 +277,7 @@ describe("MatrixAdapter", () => {
         getType: () => EventType.RoomMessageEncrypted,
         getContent: () => ({ body: "secret" }),
       }),
-      { roomId: "!room:example.com" },
+      { roomId: "!room:beeper.com" },
       false
     );
 
@@ -265,11 +287,11 @@ describe("MatrixAdapter", () => {
 
   it("enables e2ee when recovery key is provided", () => {
     const adapter = createMatrixAdapter({
-      baseURL: "https://hs.example.com",
+      baseURL: "https://hs.beeper.com",
       auth: {
         type: "accessToken",
         accessToken: "token",
-        userID: "@bot:example.com",
+        userID: "@bot:beeper.com",
       },
       recoveryKey: "s3cr3t-recovery-key",
     }) as unknown as { e2eeConfig?: { enabled?: boolean } };
@@ -279,11 +301,11 @@ describe("MatrixAdapter", () => {
 
   it("generates a device id when one is not provided", () => {
     const adapter = createMatrixAdapter({
-      baseURL: "https://hs.example.com",
+      baseURL: "https://hs.beeper.com",
       auth: {
         type: "accessToken",
         accessToken: "token",
-        userID: "@bot:example.com",
+        userID: "@bot:beeper.com",
       },
     }) as unknown as { deviceID?: string };
 
@@ -293,7 +315,7 @@ describe("MatrixAdapter", () => {
 
   it("supports typed username/password auth config", () => {
     const adapter = new MatrixAdapter({
-      baseURL: "https://hs.example.com",
+      baseURL: "https://hs.beeper.com",
       auth: {
         type: "password",
         username: "bot",
@@ -302,5 +324,207 @@ describe("MatrixAdapter", () => {
     });
 
     expect(adapter).toBeInstanceOf(MatrixAdapter);
+  });
+
+  it("shuts down matrix client cleanly", async () => {
+    const fakeClient = makeClient();
+    const adapter = new MatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: {
+        type: "accessToken",
+        accessToken: "token",
+        userID: "@bot:beeper.com",
+      },
+      createClient: () => fakeClient as never,
+    });
+
+    await adapter.initialize({
+      getLogger: () =>
+        ({
+          debug: vi.fn(),
+          info: vi.fn(),
+          warn: vi.fn(),
+          error: vi.fn(),
+          child: () => ({}) as never,
+        }) as never,
+      getState: vi.fn(() => makeStateAdapter() as never),
+      getUserName: vi.fn(),
+      handleIncomingMessage: vi.fn(),
+      processAction: vi.fn(),
+      processAppHomeOpened: vi.fn(),
+      processAssistantContextChanged: vi.fn(),
+      processAssistantThreadStarted: vi.fn(),
+      processMessage: vi.fn(),
+      processModalClose: vi.fn(),
+      processModalSubmit: vi.fn(),
+      processReaction: vi.fn(),
+      processSlashCommand: vi.fn(),
+    });
+
+    await adapter.shutdown();
+    expect(fakeClient.stopClient).toHaveBeenCalledOnce();
+  });
+
+  it("persists and reloads matrix session via chat state", async () => {
+    const baseURL = "https://hs.beeper.com";
+    const state = makeStateAdapter();
+
+    const adapter = new MatrixAdapter({
+      baseURL,
+      auth: {
+        type: "password",
+        username: "bot",
+        password: "secret",
+      },
+    });
+
+    (adapter as unknown as { stateAdapter: unknown }).stateAdapter =
+      state as unknown;
+
+    await (
+      adapter as unknown as {
+        persistSession: (session: {
+          accessToken: string;
+          deviceID?: string;
+          userID: string;
+        }) => Promise<void>;
+      }
+    ).persistSession({
+      accessToken: "persisted-token",
+      userID: "@bot:beeper.com",
+      deviceID: "DEVICE1",
+    });
+
+    const restored = await (
+      adapter as unknown as {
+        loadPersistedSession: () => Promise<{
+          accessToken: string;
+          userID: string;
+          deviceID?: string;
+        } | null>;
+      }
+    ).loadPersistedSession();
+
+    expect(state.set).toHaveBeenCalled();
+    expect(restored).toMatchObject({
+      accessToken: "persisted-token",
+      userID: "@bot:beeper.com",
+      deviceID: "DEVICE1",
+    });
+  });
+
+  it("reuses persisted password session before password login", async () => {
+    const baseURL = "https://hs.beeper.com";
+    const sessionKey = `matrix:session:${encodeURIComponent(baseURL)}:username:${encodeURIComponent("bot")}`;
+    const state = makeStateAdapter({
+      [sessionKey]: {
+        accessToken: "persisted-token",
+        authType: "password",
+        baseURL,
+        createdAt: new Date().toISOString(),
+        e2eeEnabled: false,
+        recoveryKeyPresent: false,
+        updatedAt: new Date().toISOString(),
+        userID: "@bot:beeper.com",
+        username: "bot",
+      },
+    });
+
+    const loginWithPassword = vi.fn(async () => {
+      throw new Error("should not login");
+    });
+    const whoami = vi.fn(async () => ({
+      user_id: "@bot:beeper.com",
+      device_id: "DEVICE1",
+    }));
+
+    const adapter = new MatrixAdapter({
+      baseURL,
+      auth: { type: "password", username: "bot", password: "secret" },
+      createBootstrapClient: () =>
+        ({
+          loginWithPassword,
+          whoami,
+        }) as never,
+    });
+
+    (adapter as unknown as { stateAdapter: unknown }).stateAdapter =
+      state as unknown;
+    const resolved = await (
+      adapter as unknown as {
+        resolveAuth: () => Promise<{
+          accessToken: string;
+          userID: string;
+          deviceID?: string;
+        }>;
+      }
+    ).resolveAuth();
+
+    expect(resolved).toMatchObject({
+      accessToken: "persisted-token",
+      userID: "@bot:beeper.com",
+      deviceID: "DEVICE1",
+    });
+    expect(whoami).toHaveBeenCalledOnce();
+    expect(loginWithPassword).not.toHaveBeenCalled();
+  });
+
+  it("falls back to password login when persisted session is invalid", async () => {
+    const baseURL = "https://hs.beeper.com";
+    const sessionKey = `matrix:session:${encodeURIComponent(baseURL)}:username:${encodeURIComponent("bot")}`;
+    const state = makeStateAdapter({
+      [sessionKey]: {
+        accessToken: "invalid-token",
+        authType: "password",
+        baseURL,
+        createdAt: new Date().toISOString(),
+        e2eeEnabled: false,
+        recoveryKeyPresent: false,
+        updatedAt: new Date().toISOString(),
+        userID: "@bot:beeper.com",
+        username: "bot",
+      },
+    });
+
+    const loginWithPassword = vi.fn(async () => ({
+      access_token: "fresh-token",
+      user_id: "@bot:beeper.com",
+      device_id: "DEVICE2",
+    }));
+    const whoami = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("unauthorized"))
+      .mockResolvedValueOnce({
+        user_id: "@bot:beeper.com",
+      });
+
+    const adapter = new MatrixAdapter({
+      baseURL,
+      auth: { type: "password", username: "bot", password: "secret" },
+      createBootstrapClient: () =>
+        ({
+          loginWithPassword,
+          whoami,
+        }) as never,
+    });
+
+    (adapter as unknown as { stateAdapter: unknown }).stateAdapter =
+      state as unknown;
+    const resolved = await (
+      adapter as unknown as {
+        resolveAuth: () => Promise<{
+          accessToken: string;
+          userID: string;
+          deviceID?: string;
+        }>;
+      }
+    ).resolveAuth();
+
+    expect(loginWithPassword).toHaveBeenCalledOnce();
+    expect(resolved).toMatchObject({
+      accessToken: "fresh-token",
+      userID: "@bot:beeper.com",
+      deviceID: "DEVICE2",
+    });
   });
 });
