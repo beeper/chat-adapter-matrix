@@ -741,11 +741,24 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     }
 
     const roomID = room.roomId;
+    this.logger.debug("Matrix timeline event received", {
+      eventID: event.getId(),
+      eventType: event.getType(),
+      roomID,
+      sender: event.getSender(),
+      toStartOfTimeline,
+    });
+
     if (this.roomAllowlist && !this.roomAllowlist.has(roomID)) {
+      this.logger.debug("Ignoring event outside room allowlist", { roomID });
       return;
     }
 
     if (this.userID && event.getSender() === this.userID) {
+      this.logger.debug("Ignoring self-sent event", {
+        eventID: event.getId(),
+        userID: this.userID,
+      });
       return;
     }
 
@@ -754,26 +767,47 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     const chat = this.requireChat();
 
     if (event.getType() === EventType.Reaction) {
+      this.logger.debug("Processing reaction event", {
+        eventID: event.getId(),
+        roomID,
+      });
       this.handleReactionEvent(event, roomID);
       return;
     }
 
     if (event.isRedaction()) {
+      this.logger.debug("Processing redaction event", {
+        eventID: event.getId(),
+        redacts: event.getAssociatedId(),
+      });
       this.handleReactionRedaction(event);
       return;
     }
 
     if (event.getType() !== EventType.RoomMessage) {
+      this.logger.debug("Ignoring non-room-message event", {
+        eventType: event.getType(),
+        eventID: event.getId(),
+      });
       return;
     }
 
     const threadID = this.threadIDForEvent(event, roomID);
     const message = this.parseMessage(event);
+    this.logger.debug("Dispatching Matrix message to Chat SDK", {
+      eventID: event.getId(),
+      threadID,
+      isMention: message.isMention,
+    });
 
     chat.processMessage(this, threadID, message);
 
     const slash = this.parseSlashCommand(message.text);
     if (slash) {
+      this.logger.debug("Dispatching slash command", {
+        command: slash.command,
+        threadID,
+      });
       chat.processSlashCommand({
         adapter: this,
         channelId: this.channelIdFromThreadId(threadID),
