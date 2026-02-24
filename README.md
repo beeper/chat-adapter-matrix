@@ -64,22 +64,13 @@ Required:
 - Access token mode: `MATRIX_ACCESS_TOKEN`
 - Password mode: `MATRIX_USERNAME`, `MATRIX_PASSWORD`
 
-Optional:
+Common optional:
 
 - `MATRIX_USER_ID`
 - `MATRIX_DEVICE_ID`
-- `MATRIX_DEVICE_ID_PERSIST_ENABLED`
-- `MATRIX_DEVICE_ID_PERSIST_KEY`
 - `MATRIX_RECOVERY_KEY`
-- `MATRIX_E2EE_ENABLED`
-- `MATRIX_E2EE_USE_INDEXEDDB`
-- `MATRIX_E2EE_DB_PREFIX`
-- `MATRIX_E2EE_STORAGE_PASSWORD`
-- `MATRIX_E2EE_STORAGE_KEY_BASE64`
-- `MATRIX_SESSION_ENABLED`
-- `MATRIX_SESSION_KEY`
-- `MATRIX_SESSION_TTL_MS`
-- `MATRIX_SDK_LOG_LEVEL` (`trace`, `debug`, `info`, `warn`, `error`)
+
+Advanced optional (only if needed): device ID persistence keys, E2EE storage settings, session settings, and `MATRIX_SDK_LOG_LEVEL`.
 
 ## Examples
 
