@@ -313,6 +313,20 @@ describe("MatrixAdapter", () => {
     expect(adapter.deviceID).toMatch(/^chatsdk_[A-Z0-9]{8}$/);
   });
 
+  it("generates a device id when provided deviceID is blank", () => {
+    const adapter = createMatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: {
+        type: "accessToken",
+        accessToken: "token",
+        userID: "@bot:beeper.com",
+      },
+      deviceID: "   ",
+    }) as unknown as { deviceID?: string };
+
+    expect(adapter.deviceID).toMatch(/^chatsdk_[A-Z0-9]{8}$/);
+  });
+
   it("supports typed username/password auth config", () => {
     const adapter = new MatrixAdapter({
       baseURL: "https://hs.beeper.com",

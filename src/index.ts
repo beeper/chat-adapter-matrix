@@ -126,7 +126,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
         ? (config.auth.userID ?? "")
         : (config.auth.userID ?? "");
     this.botUserID = this.userID || undefined;
-    this.deviceID = config.deviceID;
+    this.deviceID = normalizeOptionalString(config.deviceID);
     this.userName = config.userName ?? "bot";
     this.commandPrefix = config.commandPrefix ?? DEFAULT_COMMAND_PREFIX;
     this.roomAllowlist = config.roomAllowlist
@@ -165,7 +165,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       const resolvedAuth = await this.resolveAuth();
       this.userID = resolvedAuth.userID;
       this.botUserID = resolvedAuth.userID;
-      this.deviceID = resolvedAuth.deviceID ?? this.deviceID;
+      this.deviceID = normalizeOptionalString(resolvedAuth.deviceID) ?? this.deviceID;
       this.client = this.buildClient(resolvedAuth);
     }
 
@@ -1166,9 +1166,10 @@ export function createMatrixAdapter(config: MatrixAdapterConfig): MatrixAdapter;
 export function createMatrixAdapter(): MatrixAdapter;
 export function createMatrixAdapter(config?: MatrixAdapterConfig): MatrixAdapter {
   if (config) {
+    const normalizedDeviceID = normalizeOptionalString(config.deviceID);
     return new MatrixAdapter({
       ...config,
-      deviceID: config.deviceID ?? generateDeviceID(),
+      deviceID: normalizedDeviceID ?? generateDeviceID(),
     });
   }
 
@@ -1186,7 +1187,8 @@ export function createMatrixAdapter(config?: MatrixAdapterConfig): MatrixAdapter
   return new MatrixAdapter({
     baseURL,
     auth,
-    deviceID: process.env.MATRIX_DEVICE_ID ?? generateDeviceID(),
+    deviceID:
+      normalizeOptionalString(process.env.MATRIX_DEVICE_ID) ?? generateDeviceID(),
     commandPrefix: process.env.MATRIX_COMMAND_PREFIX,
     recoveryKey,
     e2ee: {
@@ -1293,4 +1295,12 @@ function generateDeviceID(length = 8): string {
   }
 
   return out;
+}
+
+function normalizeOptionalString(value: string | undefined): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
 }
