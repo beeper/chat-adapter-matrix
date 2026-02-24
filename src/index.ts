@@ -48,6 +48,12 @@ const MATRIX_PREFIX = "matrix";
 const MATRIX_SESSION_PREFIX = "matrix:session";
 const DEFAULT_COMMAND_PREFIX = "/";
 const TYPING_TIMEOUT_MS = 30_000;
+const FAST_SYNC_DEFAULTS: NonNullable<MatrixAdapterConfig["sync"]> = {
+  initialSyncLimit: 1,
+  lazyLoadMembers: true,
+  disablePresence: true,
+  pollTimeout: 10_000,
+};
 
 type MatrixMessageContent = {
   body?: string;
@@ -136,7 +142,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     this.roomAllowlist = config.roomAllowlist
       ? new Set(config.roomAllowlist)
       : undefined;
-    this.syncOptions = config.sync;
+    this.syncOptions = config.sync ?? FAST_SYNC_DEFAULTS;
     this.createClientFn = config.createClient;
     this.createBootstrapClientFn = config.createBootstrapClient;
     this.e2eeConfig = {
@@ -701,7 +707,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       storagePassword: this.e2eeConfig.storagePassword,
       storageKey: this.e2eeConfig.storageKey,
     });
-    await this.maybeLoadKeyBackupFromRecoveryKey();
+    void this.maybeLoadKeyBackupFromRecoveryKey();
 
     this.logger.info("Matrix E2EE initialized", {
       useIndexedDB: useIndexedDB !== false,

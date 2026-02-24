@@ -102,6 +102,7 @@ bun --env-file=examples/.env run examples/bot.ts
 - Session durability depends on your Chat state backend (use Redis in production).
 - If `session.encrypt` is set, `session.decrypt` is also required.
 - With `MATRIX_RECOVERY_KEY`, adapter provides secret-storage key callbacks and attempts key-backup activation.
+- Default sync mode is optimized for faster startup on large accounts (`initialSyncLimit=1`, `lazyLoadMembers=true`, `disablePresence=true`, `pollTimeout=10000`) unless `sync` is explicitly provided.
 
 ## Shutdown
 
