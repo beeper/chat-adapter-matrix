@@ -35,6 +35,7 @@ export interface MatrixAdapterConfig {
     options: { accessToken?: string; baseURL: string; deviceID?: string }
   ) => MatrixAuthBootstrapClient;
   createClient?: () => MatrixClient;
+  deviceIDPersistence?: MatrixDeviceIDPersistenceConfig;
   deviceID?: string;
   e2ee?: MatrixE2EEConfig;
   logger?: Logger;
@@ -56,6 +57,11 @@ export interface MatrixSessionConfig {
   key?: string;
   ttlMs?: number;
   decrypt?: (value: string) => string;
+}
+
+export interface MatrixDeviceIDPersistenceConfig {
+  enabled?: boolean;
+  key?: string;
 }
 
 export interface MatrixAuthBootstrapClient {

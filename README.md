@@ -61,7 +61,7 @@ auth: { type: "password", username: process.env.MATRIX_USERNAME!, password: proc
 - Outbound post/edit/delete/reaction/typing support
 - E2EE support (Rust crypto + inbound decrypt)
 - Recovery-key-based key-backup loading during E2EE init
-- Auto-generated `deviceID` when none is provided
+- Stable `deviceID` persistence via Chat state when none is provided
 - Session persistence via Chat state adapter
 - Sample event payloads in [`sample-messages.md`](./sample-messages.md)
 
@@ -71,6 +71,8 @@ auth: { type: "password", username: process.env.MATRIX_USERNAME!, password: proc
 - Access token mode: `MATRIX_ACCESS_TOKEN` (`MATRIX_USER_ID` optional)
 - Password mode: `MATRIX_USERNAME`, `MATRIX_PASSWORD` (`MATRIX_USER_ID` optional)
 - `MATRIX_DEVICE_ID` (optional)
+- `MATRIX_DEVICE_ID_PERSIST_ENABLED` (`true`/`false`, default `true`)
+- `MATRIX_DEVICE_ID_PERSIST_KEY` (optional)
 - `MATRIX_RECOVERY_KEY` (enables E2EE when present)
 - `MATRIX_E2EE_ENABLED` (`true`/`false`, optional override)
 - `MATRIX_E2EE_USE_INDEXEDDB` (`true`/`false`, default `true` only when `indexedDB` exists in runtime)
@@ -100,6 +102,7 @@ bun --env-file=examples/.env run examples/bot.ts
 
 - `handleWebhook()` returns `501` by design (Matrix uses sync polling).
 - Session durability depends on your Chat state backend (use Redis in production).
+- Session and generated deviceID stability depend on your Chat state backend (use Redis in production).
 - If `session.encrypt` is set, `session.decrypt` is also required.
 - With `MATRIX_RECOVERY_KEY`, adapter provides secret-storage key callbacks and attempts key-backup activation.
 - Default sync mode is optimized for faster startup on large accounts (`initialSyncLimit=1`, `lazyLoadMembers=true`, `disablePresence=true`, `pollTimeout=10000`) unless `sync` is explicitly provided.

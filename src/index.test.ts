@@ -337,22 +337,36 @@ describe("MatrixAdapter", () => {
     expect(result?.[1]).toBeInstanceOf(Uint8Array);
   });
 
-  it("generates a device id when one is not provided", () => {
-    const adapter = createMatrixAdapter({
+  it("generates and persists a device id when one is not provided", async () => {
+    const adapter = new MatrixAdapter({
       baseURL: "https://hs.beeper.com",
       auth: {
         type: "accessToken",
         accessToken: "token",
         userID: "@bot:beeper.com",
       },
-    }) as unknown as { deviceID?: string };
+    }) as unknown as {
+      stateAdapter: unknown;
+      resolveDeviceID: () => Promise<void>;
+      deviceID?: string;
+    };
+    const state = makeStateAdapter();
+    adapter.stateAdapter = state as unknown;
 
-    expect(adapter.deviceID).toBeDefined();
+    await adapter.resolveDeviceID();
+
     expect(adapter.deviceID).toMatch(/^chatsdk_[A-Z0-9]{8}$/);
+    expect(state.set).toHaveBeenCalled();
   });
 
-  it("generates a device id when provided deviceID is blank", () => {
-    const adapter = createMatrixAdapter({
+  it("reuses persisted device id when available", async () => {
+    const persistedDeviceID = "chatsdk_ABCDEFGH";
+    const state = makeStateAdapter({
+      "matrix:device:https%3A%2F%2Fhs.beeper.com:%40bot%3Abeeper.com":
+        persistedDeviceID,
+    });
+
+    const adapter = new MatrixAdapter({
       baseURL: "https://hs.beeper.com",
       auth: {
         type: "accessToken",
@@ -360,9 +374,16 @@ describe("MatrixAdapter", () => {
         userID: "@bot:beeper.com",
       },
       deviceID: "   ",
-    }) as unknown as { deviceID?: string };
+    }) as unknown as {
+      stateAdapter: unknown;
+      resolveDeviceID: () => Promise<void>;
+      deviceID?: string;
+    };
+    adapter.stateAdapter = state as unknown;
 
-    expect(adapter.deviceID).toMatch(/^chatsdk_[A-Z0-9]{8}$/);
+    await adapter.resolveDeviceID();
+
+    expect(adapter.deviceID).toBe(persistedDeviceID);
   });
 
   it("supports typed username/password auth config", () => {
@@ -463,6 +484,12 @@ describe("MatrixAdapter", () => {
       userID: "@bot:beeper.com",
       deviceID: "DEVICE1",
     });
+
+    expect(state.set).toHaveBeenCalledWith(
+      "matrix:session:https%3A%2F%2Fhs.beeper.com:username:bot",
+      expect.any(Object),
+      undefined
+    );
   });
 
   it("reuses persisted password session before password login", async () => {

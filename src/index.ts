@@ -45,6 +45,7 @@ import type {
 } from "./types";
 
 const MATRIX_PREFIX = "matrix";
+const MATRIX_DEVICE_PREFIX = "matrix:device";
 const MATRIX_SESSION_PREFIX = "matrix:session";
 const DEFAULT_COMMAND_PREFIX = "/";
 const TYPING_TIMEOUT_MS = 30_000;
@@ -92,6 +93,11 @@ type StoredSession = {
   username?: string;
 };
 
+type DeviceIDPersistenceConfig = {
+  enabled: boolean;
+  key?: string;
+};
+
 export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   readonly name = "matrix";
   readonly userName: string;
@@ -105,6 +111,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   private readonly createBootstrapClientFn?: MatrixAdapterConfig["createBootstrapClient"];
   private readonly e2eeConfig?: MatrixAdapterConfig["e2ee"];
   private readonly recoveryKey?: string;
+  private readonly deviceIDPersistence: DeviceIDPersistenceConfig;
   private readonly loggerProvided: boolean;
   private readonly sessionConfig: Required<
     Pick<NonNullable<MatrixAdapterConfig["session"]>, "enabled">
@@ -153,6 +160,10 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
         config.e2ee?.storagePassword ?? config.recoveryKey,
     };
     this.recoveryKey = normalizeOptionalString(config.recoveryKey);
+    this.deviceIDPersistence = {
+      enabled: config.deviceIDPersistence?.enabled ?? true,
+      key: normalizeOptionalString(config.deviceIDPersistence?.key),
+    };
     this.sessionConfig = {
       decrypt: config.session?.decrypt,
       enabled: config.session?.enabled ?? true,
@@ -174,6 +185,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       this.logger = chat.getLogger("matrix");
     }
     this.stateAdapter = chat.getState();
+    await this.resolveDeviceID();
 
     if (this.createClientFn) {
       this.client = this.createClientFn();
@@ -556,6 +568,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
         userID,
         deviceID: this.deviceID,
       };
+      await this.persistDeviceIDForResolvedUser(userID);
       await this.persistSession(resolved);
       return resolved;
     }
@@ -569,6 +582,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
           userID: whoami.userID,
           deviceID: this.deviceID ?? whoami.deviceID ?? restored.deviceID,
         };
+        await this.persistDeviceIDForResolvedUser(resolved.userID, resolved.deviceID);
         await this.persistSession(resolved);
         this.logger.info("Reused persisted Matrix session", {
           userID: resolved.userID,
@@ -597,6 +611,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       userID,
       deviceID: this.deviceID ?? loginResponse.device_id ?? undefined,
     };
+    await this.persistDeviceIDForResolvedUser(resolved.userID, resolved.deviceID);
     await this.persistSession(resolved);
     return resolved;
   }
@@ -823,14 +838,6 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       });
       return;
     }
-    this.logger.debug("Matrix timeline event received", {
-      eventID: event.getId(),
-      eventType: event.getType(),
-      roomID,
-      sender: event.getSender(),
-      toStartOfTimeline,
-    });
-
     if (this.roomAllowlist && !this.roomAllowlist.has(roomID)) {
       this.logger.debug("Ignoring event outside room allowlist", { roomID });
       return;
@@ -849,6 +856,11 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     const chat = this.requireChat();
 
     if (event.getType() === EventType.Reaction) {
+      this.logger.debug("Matrix timeline event received", {
+        eventID: event.getId(),
+        eventType: event.getType(),
+        roomID,
+      });
       this.logger.debug("Processing reaction event", {
         eventID: event.getId(),
         roomID,
@@ -858,6 +870,11 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     }
 
     if (event.isRedaction()) {
+      this.logger.debug("Matrix timeline event received", {
+        eventID: event.getId(),
+        eventType: event.getType(),
+        roomID,
+      });
       this.logger.debug("Processing redaction event", {
         eventID: event.getId(),
         redacts: event.getAssociatedId(),
@@ -866,11 +883,20 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       return;
     }
 
+    if (
+      event.getType() !== EventType.RoomMessage &&
+      event.getType() !== EventType.RoomMessageEncrypted
+    ) {
+      return;
+    }
+    this.logger.debug("Matrix timeline event received", {
+      eventID: event.getId(),
+      eventType: event.getType(),
+      roomID,
+      sender: event.getSender(),
+    });
+
     if (event.getType() !== EventType.RoomMessage) {
-      this.logger.debug("Ignoring non-room-message event", {
-        eventType: event.getType(),
-        eventID: event.getId(),
-      });
       return;
     }
 
@@ -1150,23 +1176,21 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     return `${threadId}::${messageId}::${rawEmoji}`;
   }
 
-  private getSessionStorageKeys(userID?: string): string[] {
+  private getSessionStorageKey(userID: string): string {
     if (this.sessionConfig.key) {
-      return [this.sessionConfig.key];
+      return this.sessionConfig.key;
     }
 
     const basePrefix = `${MATRIX_SESSION_PREFIX}:${encodeURIComponent(this.baseURL)}`;
-    const keys = new Set<string>();
+    return `${basePrefix}:user:${encodeURIComponent(userID)}`;
+  }
 
-    if (userID) {
-      keys.add(`${basePrefix}:user:${encodeURIComponent(userID)}`);
+  private getSessionUsernameTemporaryKey(): string | null {
+    if (this.sessionConfig.key || this.auth.type !== "password") {
+      return null;
     }
-
-    if (this.auth.type === "password") {
-      keys.add(`${basePrefix}:username:${encodeURIComponent(this.auth.username)}`);
-    }
-
-    return Array.from(keys);
+    const basePrefix = `${MATRIX_SESSION_PREFIX}:${encodeURIComponent(this.baseURL)}`;
+    return `${basePrefix}:username:${encodeURIComponent(this.auth.username)}`;
   }
 
   private async loadPersistedSession(): Promise<StoredSession | null> {
@@ -1174,12 +1198,22 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       return null;
     }
 
-    const keys = this.getSessionStorageKeys(this.auth.userID);
-    for (const key of keys) {
-      const raw = await this.stateAdapter.get<StoredSession>(key);
-      const session = this.decodeStoredSession(raw);
-      if (this.isValidStoredSession(session)) {
-        return session;
+    if (this.auth.userID) {
+      const canonicalRaw = await this.stateAdapter.get<StoredSession>(
+        this.getSessionStorageKey(this.auth.userID)
+      );
+      const canonicalSession = this.decodeStoredSession(canonicalRaw);
+      if (this.isValidStoredSession(canonicalSession)) {
+        return canonicalSession;
+      }
+    }
+
+    const temporaryKey = this.getSessionUsernameTemporaryKey();
+    if (temporaryKey) {
+      const temporaryRaw = await this.stateAdapter.get<StoredSession>(temporaryKey);
+      const temporarySession = this.decodeStoredSession(temporaryRaw);
+      if (this.isValidStoredSession(temporarySession)) {
+        return temporarySession;
       }
     }
 
@@ -1207,12 +1241,16 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     };
     const encodedSession = this.encodeStoredSession(session);
 
-    const keys = this.getSessionStorageKeys(auth.userID);
-    await Promise.all(
-      keys.map((key) =>
-        this.stateAdapter!.set(key, encodedSession, this.sessionConfig.ttlMs)
-      )
+    await this.stateAdapter.set(
+      this.getSessionStorageKey(auth.userID),
+      encodedSession,
+      this.sessionConfig.ttlMs
     );
+
+    const temporaryKey = this.getSessionUsernameTemporaryKey();
+    if (temporaryKey && temporaryKey !== this.getSessionStorageKey(auth.userID)) {
+      await this.stateAdapter.set(temporaryKey, encodedSession, this.sessionConfig.ttlMs);
+    }
   }
 
   private encodeStoredSession(session: StoredSession): StoredSession {
@@ -1305,6 +1343,91 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       );
     }
   }
+
+  private async resolveDeviceID(): Promise<void> {
+    if (this.deviceID) {
+      return;
+    }
+
+    const persisted = await this.loadPersistedDeviceID();
+    if (persisted) {
+      this.deviceID = persisted;
+      return;
+    }
+
+    const generated = generateDeviceID();
+    this.deviceID = generated;
+    await this.persistDeviceID(generated);
+  }
+
+  private getDeviceIDStorageKey(identityHint?: string): string {
+    if (this.deviceIDPersistence.key) {
+      return this.deviceIDPersistence.key;
+    }
+
+    const basePrefix = `${MATRIX_DEVICE_PREFIX}:${encodeURIComponent(this.baseURL)}`;
+    const hint =
+      identityHint ??
+      this.auth.userID ??
+      (this.auth.type === "password" ? `username:${this.auth.username}` : "default");
+    return `${basePrefix}:${encodeURIComponent(hint)}`;
+  }
+
+  private async loadPersistedDeviceID(): Promise<string | null> {
+    if (!this.deviceIDPersistence.enabled || !this.stateAdapter) {
+      return null;
+    }
+
+    const candidates = new Set<string>([
+      this.getDeviceIDStorageKey(),
+      this.getDeviceIDStorageKey(this.auth.userID),
+    ]);
+
+    for (const key of candidates) {
+      if (!key) {
+        continue;
+      }
+      const value = await this.stateAdapter.get<string | null>(key);
+      const normalized = normalizeOptionalString(value ?? undefined);
+      if (normalized) {
+        return normalized;
+      }
+    }
+
+    return null;
+  }
+
+  private async persistDeviceID(deviceID: string, identityHint?: string): Promise<void> {
+    if (!this.deviceIDPersistence.enabled || !this.stateAdapter) {
+      return;
+    }
+
+    await this.stateAdapter.set(this.getDeviceIDStorageKey(identityHint), deviceID);
+  }
+
+  private async persistDeviceIDForResolvedUser(
+    userID: string,
+    resolvedDeviceID?: string
+  ): Promise<void> {
+    const finalDeviceID = normalizeOptionalString(resolvedDeviceID) ?? this.deviceID;
+    if (!finalDeviceID) {
+      return;
+    }
+
+    this.deviceID = finalDeviceID;
+    await this.persistDeviceID(finalDeviceID, userID);
+
+    const temporaryKey = this.getDeviceIDStorageKey();
+    const canonicalKey = this.getDeviceIDStorageKey(userID);
+    if (
+      this.deviceIDPersistence.enabled &&
+      this.stateAdapter &&
+      !this.deviceIDPersistence.key &&
+      temporaryKey !== canonicalKey
+    ) {
+      await this.stateAdapter.delete(temporaryKey);
+    }
+  }
 }
 
 export function createMatrixAdapter(config: MatrixAdapterConfig): MatrixAdapter;
@@ -1314,7 +1437,7 @@ export function createMatrixAdapter(config?: MatrixAdapterConfig): MatrixAdapter
     const normalizedDeviceID = normalizeOptionalString(config.deviceID);
     return new MatrixAdapter({
       ...config,
-      deviceID: normalizedDeviceID ?? generateDeviceID(),
+      deviceID: normalizedDeviceID,
     });
   }
 
@@ -1332,8 +1455,11 @@ export function createMatrixAdapter(config?: MatrixAdapterConfig): MatrixAdapter
   return new MatrixAdapter({
     baseURL,
     auth,
-    deviceID:
-      normalizeOptionalString(process.env.MATRIX_DEVICE_ID) ?? generateDeviceID(),
+    deviceID: normalizeOptionalString(process.env.MATRIX_DEVICE_ID),
+    deviceIDPersistence: {
+      enabled: envBool(process.env.MATRIX_DEVICE_ID_PERSIST_ENABLED, true),
+      key: normalizeOptionalString(process.env.MATRIX_DEVICE_ID_PERSIST_KEY),
+    },
     commandPrefix: process.env.MATRIX_COMMAND_PREFIX,
     recoveryKey,
     e2ee: {
