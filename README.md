@@ -89,6 +89,12 @@ npm run example:bun
 npm run example:bun:redis
 ```
 
+Direct Bun command:
+
+```bash
+bun --env-file=examples/.env run examples/bot.ts
+```
+
 ## Notes
 
 - `handleWebhook()` returns `501` by design (Matrix uses sync polling).

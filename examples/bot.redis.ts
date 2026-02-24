@@ -26,9 +26,16 @@ bot.onSlashCommand("/ping", async (event) => {
   await event.channel.post("pong");
 });
 
+await bot.initialize();
 console.log("Matrix adapter bot (Redis state) started via sync.");
 
 process.on("SIGINT", async () => {
+  console.log("Shutting down...");
+  await matrix.shutdown();
+  process.exit(0);
+});
+
+process.on("SIGTERM", async () => {
   console.log("Shutting down...");
   await matrix.shutdown();
   process.exit(0);
