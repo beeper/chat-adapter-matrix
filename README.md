@@ -82,6 +82,7 @@ auth: { type: "password", username: process.env.MATRIX_USERNAME!, password: proc
 - `MATRIX_SESSION_ENABLED` (`true`/`false`, default `true`)
 - `MATRIX_SESSION_KEY` (optional)
 - `MATRIX_SESSION_TTL_MS` (optional)
+- `MATRIX_SDK_LOG_LEVEL` (`trace`/`debug`/`info`/`warn`/`error`, default `error` in env-based factory)
 
 ## Examples
 
@@ -103,6 +104,7 @@ bun --env-file=examples/.env run examples/bot.ts
 - `handleWebhook()` returns `501` by design (Matrix uses sync polling).
 - Session durability depends on your Chat state backend (use Redis in production).
 - Session and generated deviceID stability depend on your Chat state backend (use Redis in production).
+- Access-token auth resolves `user_id`/`device_id` via `whoami`; password auth sends configured `device_id` during login.
 - If `session.encrypt` is set, `session.decrypt` is also required.
 - With `MATRIX_RECOVERY_KEY`, adapter provides secret-storage key callbacks and attempts key-backup activation.
 - Default sync mode is optimized for faster startup on large accounts (`initialSyncLimit=1`, `lazyLoadMembers=true`, `disablePresence=true`, `pollTimeout=10000`) unless `sync` is explicitly provided.
