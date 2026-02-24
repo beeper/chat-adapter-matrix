@@ -118,6 +118,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   private botUserID?: string;
   private readonly reactionByEventID = new Map<string, StoredReaction>();
   private readonly myReactionByKey = new Map<string, string>();
+  private readonly processedTimelineEventIDs = new Set<string>();
   private shuttingDown = false;
 
   constructor(config: MatrixAdapterConfig) {
@@ -183,6 +184,12 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
 
     this.client.on(RoomEvent.Timeline, (event, room, toStartOfTimeline) => {
       void this.onTimelineEvent(event, room, Boolean(toStartOfTimeline));
+    });
+    this.client.on(ClientEvent.Event, (event) => {
+      if (!event.getRoomId()) {
+        return;
+      }
+      void this.onTimelineEvent(event, undefined, false);
     });
 
     await this.maybeInitE2EE();
@@ -778,11 +785,25 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     room: Room | undefined,
     toStartOfTimeline: boolean
   ): Promise<void> {
-    if (!room || toStartOfTimeline) {
+    if (toStartOfTimeline) {
       return;
     }
 
-    const roomID = room.roomId;
+    const eventID = event.getId();
+    if (eventID) {
+      if (this.processedTimelineEventIDs.has(eventID)) {
+        return;
+      }
+      this.processedTimelineEventIDs.add(eventID);
+      if (this.processedTimelineEventIDs.size > 10_000) {
+        this.processedTimelineEventIDs.clear();
+      }
+    }
+
+    const roomID = room?.roomId ?? event.getRoomId();
+    if (!roomID) {
+      return;
+    }
     this.logger.debug("Matrix timeline event received", {
       eventID: event.getId(),
       eventType: event.getType(),
