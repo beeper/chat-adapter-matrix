@@ -1283,10 +1283,10 @@ function parseEnvNumber(value: string | undefined): number | undefined {
   return parsed;
 }
 
-function generateDeviceID(length = 10): string {
+function generateDeviceID(length = 8): string {
   const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
   const bytes = randomBytes(length);
-  let out = "";
+  let out = "bbctl_";
 
   for (let i = 0; i < length; i += 1) {
     out += alphabet[bytes[i] % alphabet.length];
