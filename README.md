@@ -87,6 +87,12 @@ Copy [`examples/.env.example`](./examples/.env.example) to `examples/.env`, then
 npm run example:bun
 ```
 
+Generate a Beeper access token interactively:
+
+```bash
+npm run token:bun
+```
+
 or:
 
 ```bash

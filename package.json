@@ -20,6 +20,7 @@
     "dev": "tsup --watch",
     "example:bun": "bun --env-file=examples/.env run examples/bot.ts",
     "example:bun:redis": "bun --env-file=examples/.env run examples/bot.redis.ts",
+    "token:bun": "bun run scripts/get-access-token.ts",
     "clean:repo": "rm -rf dist coverage",
     "test": "vitest run --coverage",
     "test:watch": "vitest",
