@@ -2,6 +2,8 @@
 
 Matrix adapter for [Chat SDK](https://chat-sdk.dev/docs). Uses Matrix sync (no webhook server required).
 
+If you are using Beeper, you can use Chat SDK with your Beeper Cloud accounts and Matrix chats. This lets you use Chat SDK with WhatsApp, Telegram, Instagram, Signal, X Chat, and more. For bridged chats, we recommend personal usage, since some networks may limit automated activity.
+
 ## Installation
 
 ```bash
@@ -92,6 +94,23 @@ Generate a Beeper access token interactively:
 ```bash
 npm run token:bun
 ```
+
+## Get a Beeper Access Token
+
+Use the interactive helper:
+
+```bash
+npm run token:bun
+```
+
+It prints:
+
+- `MATRIX_BASE_URL`
+- `MATRIX_ACCESS_TOKEN`
+- `MATRIX_USER_ID`
+- `MATRIX_DEVICE_ID`
+
+Paste those values into `examples/.env` or your deployment secrets.
 
 or:
 
