@@ -72,7 +72,7 @@ auth: { type: "password", username: process.env.MATRIX_USERNAME!, password: proc
 - `MATRIX_DEVICE_ID` (optional)
 - `MATRIX_RECOVERY_KEY` (enables E2EE when present)
 - `MATRIX_E2EE_ENABLED` (`true`/`false`, optional override)
-- `MATRIX_E2EE_USE_INDEXEDDB` (`true`/`false`, default `true`)
+- `MATRIX_E2EE_USE_INDEXEDDB` (`true`/`false`, default `true` only when `indexedDB` exists in runtime)
 - `MATRIX_E2EE_DB_PREFIX` (optional)
 - `MATRIX_E2EE_STORAGE_PASSWORD` (optional)
 - `MATRIX_E2EE_STORAGE_KEY_BASE64` (optional)

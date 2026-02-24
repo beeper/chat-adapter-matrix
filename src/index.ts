@@ -657,15 +657,27 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       );
     }
 
+    const requestedIndexedDB = this.e2eeConfig.useIndexedDB;
+    const useIndexedDB =
+      requestedIndexedDB === true && !hasIndexedDB()
+        ? false
+        : requestedIndexedDB;
+
+    if (requestedIndexedDB === true && useIndexedDB === false) {
+      this.logger.warn(
+        "IndexedDB requested for Matrix E2EE, but indexedDB is unavailable in this runtime. Falling back to non-IndexedDB crypto store."
+      );
+    }
+
     await this.requireClient().initRustCrypto({
-      useIndexedDB: this.e2eeConfig.useIndexedDB,
+      useIndexedDB,
       cryptoDatabasePrefix: this.e2eeConfig.cryptoDatabasePrefix,
       storagePassword: this.e2eeConfig.storagePassword,
       storageKey: this.e2eeConfig.storageKey,
     });
 
     this.logger.info("Matrix E2EE initialized", {
-      useIndexedDB: this.e2eeConfig.useIndexedDB !== false,
+      useIndexedDB: useIndexedDB !== false,
       cryptoDatabasePrefix: this.e2eeConfig.cryptoDatabasePrefix,
     });
   }
@@ -1193,7 +1205,10 @@ export function createMatrixAdapter(config?: MatrixAdapterConfig): MatrixAdapter
     recoveryKey,
     e2ee: {
       enabled: e2eeEnabled,
-      useIndexedDB: envBool(process.env.MATRIX_E2EE_USE_INDEXEDDB, true),
+      useIndexedDB: envBool(
+        process.env.MATRIX_E2EE_USE_INDEXEDDB,
+        hasIndexedDB()
+      ),
       cryptoDatabasePrefix: process.env.MATRIX_E2EE_DB_PREFIX,
       storagePassword: process.env.MATRIX_E2EE_STORAGE_PASSWORD ?? recoveryKey,
       storageKey: decodeBase64(
@@ -1303,4 +1318,8 @@ function normalizeOptionalString(value: string | undefined): string | undefined 
   }
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function hasIndexedDB(): boolean {
+  return typeof globalThis.indexedDB !== "undefined" && globalThis.indexedDB !== null;
 }
