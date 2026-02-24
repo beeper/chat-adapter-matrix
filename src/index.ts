@@ -125,6 +125,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   private readonly reactionByEventID = new Map<string, StoredReaction>();
   private readonly myReactionByKey = new Map<string, string>();
   private readonly processedTimelineEventIDs = new Set<string>();
+  private liveSyncReady = false;
   private shuttingDown = false;
 
   constructor(config: MatrixAdapterConfig) {
@@ -185,6 +186,9 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     }
 
     this.client.on(ClientEvent.Sync, (state: string) => {
+      if (state === "PREPARED" || state === "SYNCING") {
+        this.liveSyncReady = true;
+      }
       this.logger.debug("Matrix sync state", { state });
     });
 
@@ -808,6 +812,15 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
 
     const roomID = room?.roomId ?? event.getRoomId();
     if (!roomID) {
+      return;
+    }
+
+    if (!this.liveSyncReady) {
+      this.logger.debug("Ignoring pre-live-sync event", {
+        eventID,
+        eventType: event.getType(),
+        roomID,
+      });
       return;
     }
     this.logger.debug("Matrix timeline event received", {

@@ -72,6 +72,11 @@ function makeStateAdapter(initial: Record<string, unknown> = {}) {
   };
 }
 
+function markSyncReady(client: ReturnType<typeof makeClient>) {
+  const syncHandler = client.__handlers.get("sync");
+  syncHandler?.("PREPARED");
+}
+
 describe("MatrixAdapter", () => {
   it("encodes and decodes thread IDs", () => {
     const adapter = new MatrixAdapter({
@@ -135,6 +140,7 @@ describe("MatrixAdapter", () => {
 
     const timelineHandler = fakeClient.__handlers.get("Room.timeline");
     expect(timelineHandler).toBeTruthy();
+    markSyncReady(fakeClient);
 
     timelineHandler?.(
       makeEvent({
@@ -191,6 +197,7 @@ describe("MatrixAdapter", () => {
     });
 
     const timelineHandler = fakeClient.__handlers.get("Room.timeline");
+    markSyncReady(fakeClient);
 
     timelineHandler?.(
       makeEvent({
@@ -273,6 +280,7 @@ describe("MatrixAdapter", () => {
     expect(fakeClient.initRustCrypto).toHaveBeenCalledOnce();
 
     const timelineHandler = fakeClient.__handlers.get("Room.timeline");
+    markSyncReady(fakeClient);
     timelineHandler?.(
       makeEvent({
         getType: () => EventType.RoomMessageEncrypted,
