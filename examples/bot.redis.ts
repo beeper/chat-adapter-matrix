@@ -1,4 +1,4 @@
-import { Chat } from "chat";
+import { Chat, ConsoleLogger } from "chat";
 import { createRedisState } from "@chat-adapter/state-redis";
 import { createMatrixAdapter } from "../src/index";
 
@@ -7,10 +7,16 @@ if (!redisURL) {
   throw new Error("Set REDIS_URL for the Redis-backed example.");
 }
 
+const logger = new ConsoleLogger(
+  (process.env.LOG_LEVEL as "debug" | "info" | "warn" | "error" | undefined) ??
+    "info"
+);
+
 const matrix = createMatrixAdapter();
 
 const bot = new Chat({
   userName: process.env.BOT_USER_NAME ?? "beeper-bot",
+  logger,
   state: createRedisState({ url: redisURL }),
   adapters: {
     matrix,

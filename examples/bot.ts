@@ -1,11 +1,17 @@
-import { Chat } from "chat";
+import { Chat, ConsoleLogger } from "chat";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { createMatrixAdapter } from "../src/index";
+
+const logger = new ConsoleLogger(
+  (process.env.LOG_LEVEL as "debug" | "info" | "warn" | "error" | undefined) ??
+    "info"
+);
 
 const matrix = createMatrixAdapter();
 
 const bot = new Chat({
   userName: process.env.BOT_USER_NAME ?? "beeper-bot",
+  logger,
   state: createMemoryState(),
   adapters: {
     matrix,

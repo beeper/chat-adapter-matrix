@@ -99,6 +99,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   private readonly createBootstrapClientFn?: MatrixAdapterConfig["createBootstrapClient"];
   private readonly e2eeConfig?: MatrixAdapterConfig["e2ee"];
   private readonly recoveryKey?: string;
+  private readonly loggerProvided: boolean;
   private readonly sessionConfig: Required<
     Pick<NonNullable<MatrixAdapterConfig["session"]>, "enabled">
   > &
@@ -107,7 +108,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       "decrypt" | "encrypt" | "key" | "ttlMs"
     >;
 
-  private readonly logger: Logger;
+  private logger: Logger;
   private chat: ChatInstance | null = null;
   private stateAdapter: StateAdapter | null = null;
   private client: MatrixClient | null = null;
@@ -151,6 +152,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       key: config.session?.key,
       ttlMs: config.session?.ttlMs,
     };
+    this.loggerProvided = Boolean(config.logger);
     this.logger = config.logger ?? new ConsoleLogger("info").child("matrix");
   }
 
@@ -160,6 +162,9 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     }
 
     this.chat = chat;
+    if (!this.loggerProvided) {
+      this.logger = chat.getLogger("matrix");
+    }
     this.stateAdapter = chat.getState();
 
     if (this.createClientFn) {
