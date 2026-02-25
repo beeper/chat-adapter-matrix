@@ -77,6 +77,32 @@ function markSyncReady(client: ReturnType<typeof makeClient>) {
   syncHandler?.("PREPARED");
 }
 
+function makeChatInstance(overrides: Record<string, unknown> = {}) {
+  return {
+    getLogger: () =>
+      ({
+        debug: vi.fn(),
+        info: vi.fn(),
+        warn: vi.fn(),
+        error: vi.fn(),
+        child: () => ({}) as never,
+      }) as never,
+    getState: vi.fn(),
+    getUserName: vi.fn(),
+    handleIncomingMessage: vi.fn(),
+    processAction: vi.fn(),
+    processAppHomeOpened: vi.fn(),
+    processAssistantContextChanged: vi.fn(),
+    processAssistantThreadStarted: vi.fn(),
+    processMessage: vi.fn(),
+    processModalClose: vi.fn(),
+    processModalSubmit: vi.fn(),
+    processReaction: vi.fn(),
+    processSlashCommand: vi.fn(),
+    ...overrides,
+  };
+}
+
 describe("MatrixAdapter", () => {
   it("encodes and decodes thread IDs", () => {
     const adapter = new MatrixAdapter({
@@ -116,27 +142,7 @@ describe("MatrixAdapter", () => {
     const processMessage = vi.fn();
     const processSlashCommand = vi.fn();
 
-    await adapter.initialize({
-      getLogger: () => ({
-        debug: vi.fn(),
-        info: vi.fn(),
-        warn: vi.fn(),
-        error: vi.fn(),
-        child: () => ({}) as never,
-      }) as never,
-      getState: vi.fn(),
-      getUserName: vi.fn(),
-      handleIncomingMessage: vi.fn(),
-      processAction: vi.fn(),
-      processAppHomeOpened: vi.fn(),
-      processAssistantContextChanged: vi.fn(),
-      processAssistantThreadStarted: vi.fn(),
-      processMessage,
-      processModalClose: vi.fn(),
-      processModalSubmit: vi.fn(),
-      processReaction: vi.fn(),
-      processSlashCommand,
-    });
+    await adapter.initialize(makeChatInstance({ processMessage, processSlashCommand }) as never);
 
     const timelineHandler = fakeClient.__handlers.get("Room.timeline");
     expect(timelineHandler).toBeTruthy();
@@ -174,27 +180,7 @@ describe("MatrixAdapter", () => {
       createClient: () => fakeClient as never,
     });
 
-    await adapter.initialize({
-      getLogger: () => ({
-        debug: vi.fn(),
-        info: vi.fn(),
-        warn: vi.fn(),
-        error: vi.fn(),
-        child: () => ({}) as never,
-      }) as never,
-      getState: vi.fn(),
-      getUserName: vi.fn(),
-      handleIncomingMessage: vi.fn(),
-      processAction: vi.fn(),
-      processAppHomeOpened: vi.fn(),
-      processAssistantContextChanged: vi.fn(),
-      processAssistantThreadStarted: vi.fn(),
-      processMessage: vi.fn(),
-      processModalClose: vi.fn(),
-      processModalSubmit: vi.fn(),
-      processReaction,
-      processSlashCommand: vi.fn(),
-    });
+    await adapter.initialize(makeChatInstance({ processReaction }) as never);
 
     const timelineHandler = fakeClient.__handlers.get("Room.timeline");
     markSyncReady(fakeClient);
@@ -255,27 +241,7 @@ describe("MatrixAdapter", () => {
       e2ee: { enabled: true },
     });
 
-    await adapter.initialize({
-      getLogger: () => ({
-        debug: vi.fn(),
-        info: vi.fn(),
-        warn: vi.fn(),
-        error: vi.fn(),
-        child: () => ({}) as never,
-      }) as never,
-      getState: vi.fn(),
-      getUserName: vi.fn(),
-      handleIncomingMessage: vi.fn(),
-      processAction: vi.fn(),
-      processAppHomeOpened: vi.fn(),
-      processAssistantContextChanged: vi.fn(),
-      processAssistantThreadStarted: vi.fn(),
-      processMessage,
-      processModalClose: vi.fn(),
-      processModalSubmit: vi.fn(),
-      processReaction: vi.fn(),
-      processSlashCommand: vi.fn(),
-    });
+    await adapter.initialize(makeChatInstance({ processMessage }) as never);
 
     expect(fakeClient.initRustCrypto).toHaveBeenCalledOnce();
 
@@ -411,28 +377,7 @@ describe("MatrixAdapter", () => {
       createClient: () => fakeClient as never,
     });
 
-    await adapter.initialize({
-      getLogger: () =>
-        ({
-          debug: vi.fn(),
-          info: vi.fn(),
-          warn: vi.fn(),
-          error: vi.fn(),
-          child: () => ({}) as never,
-        }) as never,
-      getState: vi.fn(() => makeStateAdapter() as never),
-      getUserName: vi.fn(),
-      handleIncomingMessage: vi.fn(),
-      processAction: vi.fn(),
-      processAppHomeOpened: vi.fn(),
-      processAssistantContextChanged: vi.fn(),
-      processAssistantThreadStarted: vi.fn(),
-      processMessage: vi.fn(),
-      processModalClose: vi.fn(),
-      processModalSubmit: vi.fn(),
-      processReaction: vi.fn(),
-      processSlashCommand: vi.fn(),
-    });
+    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter() as never) }) as never);
 
     await adapter.shutdown();
     expect(fakeClient.stopClient).toHaveBeenCalledOnce();

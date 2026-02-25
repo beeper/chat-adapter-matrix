@@ -312,13 +312,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       threadId: threadID,
       text,
       formatted: parseMarkdown(text),
-      author: {
-        userId: sender,
-        userName: sender,
-        fullName: sender,
-        isBot: sender === this.userID,
-        isMe: sender === this.userID,
-      },
+      author: this.makeUser(sender),
       metadata: {
         dateSent: new Date(raw.getTs()),
         edited: this.isEdited(raw),
@@ -999,13 +993,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       emoji,
       rawEmoji: key,
       added: true,
-      user: {
-        userId: sender,
-        userName: sender,
-        fullName: sender,
-        isBot: sender === this.userID,
-        isMe: sender === this.userID,
-      },
+      user: this.makeUser(sender),
       raw: event,
     });
   }
@@ -1030,13 +1018,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       emoji: reaction.emoji,
       rawEmoji: reaction.rawEmoji,
       added: false,
-      user: {
-        userId: reaction.userID,
-        userName: reaction.userID,
-        fullName: reaction.userID,
-        isBot: reaction.userID === this.userID,
-        isMe: reaction.userID === this.userID,
-      },
+      user: this.makeUser(reaction.userID),
       raw: event,
     });
   }
@@ -1193,6 +1175,16 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     return event;
   }
 
+  private makeUser(userId: string) {
+    return {
+      userId,
+      userName: userId,
+      fullName: userId,
+      isBot: userId === this.userID,
+      isMe: userId === this.userID,
+    };
+  }
+
   private myReactionKey(
     threadId: string,
     messageId: string,
@@ -1201,21 +1193,23 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     return `${threadId}::${messageId}::${rawEmoji}`;
   }
 
+  private get sessionBasePrefix(): string {
+    return `${MATRIX_SESSION_PREFIX}:${encodeURIComponent(this.baseURL)}`;
+  }
+
   private getSessionStorageKey(userID: string): string {
     if (this.sessionConfig.key) {
       return this.sessionConfig.key;
     }
 
-    const basePrefix = `${MATRIX_SESSION_PREFIX}:${encodeURIComponent(this.baseURL)}`;
-    return `${basePrefix}:user:${encodeURIComponent(userID)}`;
+    return `${this.sessionBasePrefix}:user:${encodeURIComponent(userID)}`;
   }
 
   private getSessionUsernameTemporaryKey(): string | null {
     if (this.sessionConfig.key || this.auth.type !== "password") {
       return null;
     }
-    const basePrefix = `${MATRIX_SESSION_PREFIX}:${encodeURIComponent(this.baseURL)}`;
-    return `${basePrefix}:username:${encodeURIComponent(this.auth.username)}`;
+    return `${this.sessionBasePrefix}:username:${encodeURIComponent(this.auth.username)}`;
   }
 
   private async loadPersistedSession(): Promise<StoredSession | null> {
