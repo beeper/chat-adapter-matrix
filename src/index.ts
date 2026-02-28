@@ -887,7 +887,12 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       const mapped = this.mapRawEvent(rawEvent, roomID);
       await this.tryDecryptEvent(mapped);
       return mapped;
-    } catch {
+    } catch (error) {
+      this.logger.debug("Failed to fetch room event", {
+        roomID,
+        eventID,
+        error: String(error),
+      });
       return null;
     }
   }
@@ -2102,5 +2107,5 @@ function parseSDKLogLevel(
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
