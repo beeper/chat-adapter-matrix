@@ -1,8 +1,10 @@
 # @beeper/chat-adapter-matrix
 
-Matrix adapter for [Chat SDK](https://chat-sdk.dev/docs). Uses Matrix sync (no webhook server required).
+Matrix adapter for [Chat SDK](https://chat-sdk.dev/docs).
 
-If you are using Beeper, you can use Chat SDK with your Beeper Cloud accounts and Matrix chats. This lets you use Chat SDK with WhatsApp, Telegram, Instagram, Signal, X Chat, and more. For bridged chats, we recommend personal usage, since some networks may limit automated activity.
+This adapter runs over Matrix sync, so you do not need to host a webhook endpoint.
+
+If you use Beeper, this adapter lets your Chat SDK bot work with your Matrix/Beeper conversations (including bridged networks such as WhatsApp, Telegram, Instagram, Signal, and others).
 
 ## Installation
 
@@ -10,7 +12,7 @@ If you are using Beeper, you can use Chat SDK with your Beeper Cloud accounts an
 npm install chat @beeper/chat-adapter-matrix matrix-js-sdk
 ```
 
-## Usage
+## Quick Start
 
 ```ts
 import { Chat } from "chat";
@@ -38,7 +40,9 @@ bot.onNewMention(async (thread, message) => {
 });
 ```
 
-## Auth
+## Authentication
+
+Use either access-token auth or username/password auth.
 
 Access token:
 
@@ -70,9 +74,9 @@ Common optional:
 - `MATRIX_DEVICE_ID`
 - `MATRIX_RECOVERY_KEY`
 
-Advanced optional (only if needed): device ID persistence keys, E2EE storage settings, session settings, and `MATRIX_SDK_LOG_LEVEL`.
+Advanced options are available for device/session persistence, E2EE storage, and SDK logging (`MATRIX_SDK_LOG_LEVEL`).
 
-## Examples
+## Running The Example
 
 Copy [`examples/.env.example`](./examples/.env.example) to `examples/.env`, then run:
 
@@ -80,41 +84,24 @@ Copy [`examples/.env.example`](./examples/.env.example) to `examples/.env`, then
 npm run example:bun
 ```
 
-Generate a Beeper access token interactively:
+If you need Beeper credentials, generate them interactively:
 
 ```bash
 npm run token:bun
 ```
 
-## Get a Beeper Access Token
-
-Use the interactive helper:
-
-```bash
-npm run token:bun
-```
-
-It prints:
+The helper prints:
 
 - `MATRIX_BASE_URL`
 - `MATRIX_ACCESS_TOKEN`
 - `MATRIX_USER_ID`
 - `MATRIX_DEVICE_ID`
 
-Paste those values into `examples/.env` or your deployment secrets.
-
-or:
+Then run:
 
 ```bash
 bun --env-file=examples/.env run examples/bot.ts
 ```
-
-## Notes
-
-- `handleWebhook()` returns `501` by design.
-- Access-token auth resolves identity with `whoami`.
-- Password auth sends configured `device_id` during login.
-- Use Redis state in production for stable sessions and device IDs.
 
 ## Capabilities
 
@@ -122,7 +109,14 @@ bun --env-file=examples/.env run examples/bot.ts
 - `fetchMessage(threadId, messageId)` fetches a single message with thread/channel context validation.
 - `fetchChannelMessages(channelId, options)` fetches top-level room timeline messages.
 - `fetchMessages(threadId, options)` and `listThreads(channelId, options)` use API-first server pagination via `matrix-js-sdk`.
-- `postEphemeral`, `openModal`, and native `stream` are not implemented in this adapter.
+- `postEphemeral`, `openModal`, and native `stream` are not implemented by this adapter.
+
+## Notes
+
+- `handleWebhook()` returns `501` by design, since this adapter is sync-based.
+- Access-token auth resolves identity with `whoami`.
+- Password auth sends the configured `device_id` during login.
+- For production, use Redis state for stable sessions and device IDs.
 
 For release-specific changes and migration notes, see [CHANGELOG.md](./CHANGELOG.md).
 
