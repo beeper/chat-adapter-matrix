@@ -73,6 +73,7 @@ Common optional:
 - `MATRIX_USER_ID`
 - `MATRIX_DEVICE_ID`
 - `MATRIX_RECOVERY_KEY`
+- `MATRIX_BOT_USERNAME` (mention detection display name, defaults to `MOM_BOT_USERNAME` then `bot`)
 
 Advanced options are available for device/session persistence, E2EE storage, and SDK logging (`MATRIX_SDK_LOG_LEVEL`).
 

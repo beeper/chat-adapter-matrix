@@ -41,6 +41,10 @@ import sdk, {
   THREAD_RELATION_TYPE,
 } from "matrix-js-sdk";
 import { decodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key";
+import type {
+  RoomMessageEventContent,
+  RoomMessageTextEventContent,
+} from "matrix-js-sdk/lib/@types/events";
 import { logger as matrixSDKLogger } from "matrix-js-sdk/lib/logger";
 import type {
   MatrixAuthBootstrapClient,
@@ -78,6 +82,17 @@ type MatrixMessageContent = {
   formatted_body?: string;
   msgtype?: string;
   [key: string]: unknown;
+};
+
+type MatrixTextMessageContent = RoomMessageTextEventContent & {
+  "com.beeper.dont_render_edited"?: boolean;
+};
+
+type MatrixRoomMessageContent = RoomMessageEventContent & {
+  "com.beeper.dont_render_edited"?: boolean;
+  "m.new_content"?: RoomMessageEventContent & {
+    "com.beeper.dont_render_edited"?: boolean;
+  };
 };
 
 type StoredReaction = {
@@ -253,8 +268,8 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     this.started = true;
 
     this.logger.info("Matrix adapter initialized", {
-      userID: this.userID,
-      baseURL: this.baseURL,
+      userId: this.userID,
+      baseUrl: this.baseURL,
     });
   }
 
@@ -353,20 +368,23 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   ): Promise<RawMessage<MatrixEvent>> {
     const { roomID, rootEventID } = this.decodeThreadId(threadId);
     const baseContent = this.toRoomMessageContent(message);
-
-    const response = await this.sendRoomMessage(roomID, rootEventID, {
+    const newContent: MatrixTextMessageContent = {
+      ...baseContent,
       "com.beeper.dont_render_edited": true,
-      "m.new_content": {
-        msgtype: baseContent.msgtype,
-        body: baseContent.body,
-      },
+    };
+
+    const editContent: MatrixRoomMessageContent = {
+      "com.beeper.dont_render_edited": true,
+      "m.new_content": newContent,
       "m.relates_to": {
         rel_type: RelationType.Replace,
         event_id: messageId,
       },
-      msgtype: baseContent.msgtype,
+      msgtype: newContent.msgtype,
       body: `* ${baseContent.body}`,
-    });
+    };
+
+    const response = await this.sendRoomMessage(roomID, rootEventID, editContent);
 
     return {
       id: response.event_id,
@@ -711,36 +729,40 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       throw new Error(`Invalid cursor format. ${String(error)}`);
     }
 
-    if (!parsed || typeof parsed !== "object") {
+    if (!isRecord(parsed)) {
       throw new Error("Invalid cursor format. Cursor payload must be an object.");
     }
 
-    const payload = parsed as Partial<CursorV1Payload>;
-    if (payload.kind !== expectedKind) {
+    if (parsed.kind !== expectedKind) {
       throw new Error(`Invalid cursor kind. Expected ${expectedKind}.`);
     }
-    if (payload.roomID !== expectedRoomID) {
+    if (parsed.roomID !== expectedRoomID) {
       throw new Error("Invalid cursor context. Room mismatch.");
     }
-    if (
-      payload.dir !== "forward" &&
-      payload.dir !== "backward"
-    ) {
+    if (parsed.dir !== "forward" && parsed.dir !== "backward") {
       throw new Error("Invalid cursor format. Invalid direction.");
     }
-    if (!payload.token || typeof payload.token !== "string") {
+    if (typeof parsed.token !== "string" || parsed.token.length === 0) {
       throw new Error("Invalid cursor format. Missing token.");
     }
 
+    const rootEventID =
+      typeof parsed.rootEventID === "string" ? parsed.rootEventID : undefined;
     if (expectedRootEventID) {
-      if (payload.rootEventID !== expectedRootEventID) {
+      if (rootEventID !== expectedRootEventID) {
         throw new Error("Invalid cursor context. Thread mismatch.");
       }
-    } else if (payload.rootEventID) {
+    } else if (rootEventID) {
       throw new Error("Invalid cursor context. Unexpected thread scope.");
     }
 
-    return payload as CursorV1Payload;
+    return {
+      dir: parsed.dir,
+      kind: expectedKind,
+      roomID: expectedRoomID,
+      rootEventID,
+      token: parsed.token,
+    };
   }
 
   private async fetchRoomMessagesPage(args: {
@@ -1011,13 +1033,14 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
         await this.persistDeviceIDForResolvedUser(resolved.userID, resolved.deviceID);
         await this.persistSession(resolved);
         this.logger.info("Reused persisted Matrix session", {
-          userID: resolved.userID,
+          userId: resolved.userID,
         });
         return resolved;
       } catch (error) {
-        this.logger.warn("Persisted Matrix session is invalid. Falling back to password login.", {
-          error: String(error),
-        });
+        this.logger.warn(
+          "Persisted Matrix session is invalid. Falling back to password login.",
+          { error }
+        );
       }
     }
 
@@ -1110,29 +1133,30 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       });
     }
 
-    return sdk.createClient({
+    const client = sdk.createClient({
       baseUrl: this.baseURL,
       accessToken: args?.accessToken,
       deviceId: args?.deviceID,
-    }) as MatrixAuthBootstrapClient;
+    });
+
+    return {
+      loginRequest: client.loginRequest?.bind(client),
+      loginWithPassword: client.loginWithPassword.bind(client),
+      whoami: client.whoami.bind(client),
+    };
   }
 
   private sendRoomMessage(
     roomID: string,
     rootEventID: string | undefined,
-    content: unknown
+    content: MatrixRoomMessageContent
   ) {
     const client = this.requireClient();
     if (rootEventID) {
-      return client.sendEvent(
-        roomID,
-        rootEventID,
-        EventType.RoomMessage,
-        content as never
-      );
+      return client.sendEvent(roomID, rootEventID, EventType.RoomMessage, content);
     }
 
-    return client.sendEvent(roomID, EventType.RoomMessage, content as never);
+    return client.sendEvent(roomID, EventType.RoomMessage, content);
   }
 
   private async maybeInitE2EE(): Promise<void> {
@@ -1189,7 +1213,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     } catch (error) {
       this.logger.warn(
         "Failed to load Matrix key backup from recovery key. E2EE will run, but historical key restore may be unavailable.",
-        { error: String(error) }
+        { error }
       );
     }
   }
@@ -1207,8 +1231,8 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       await this.requireClient().decryptEventIfNeeded(event);
     } catch (error) {
       this.logger.warn("Failed to decrypt Matrix event", {
-        eventID: event.getId(),
-        error: String(error),
+        eventId: event.getId(),
+        error,
       });
     }
   }
@@ -1270,21 +1294,21 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
 
     if (!this.liveSyncReady) {
       this.logger.debug("Ignoring pre-live-sync event", {
-        eventID,
+        eventId: eventID,
         eventType: event.getType(),
-        roomID,
+        roomId: roomID,
       });
       return;
     }
     if (this.roomAllowlist && !this.roomAllowlist.has(roomID)) {
-      this.logger.debug("Ignoring event outside room allowlist", { roomID });
+      this.logger.debug("Ignoring event outside room allowlist", { roomId: roomID });
       return;
     }
 
     if (this.userID && event.getSender() === this.userID) {
       this.logger.debug("Ignoring self-sent event", {
-        eventID: event.getId(),
-        userID: this.userID,
+        eventId: event.getId(),
+        userId: this.userID,
       });
       return;
     }
@@ -1295,13 +1319,13 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
 
     if (event.getType() === EventType.Reaction) {
       this.logger.debug("Matrix timeline event received", {
-        eventID: event.getId(),
+        eventId: event.getId(),
         eventType: event.getType(),
-        roomID,
+        roomId: roomID,
       });
       this.logger.debug("Processing reaction event", {
-        eventID: event.getId(),
-        roomID,
+        eventId: event.getId(),
+        roomId: roomID,
       });
       this.handleReactionEvent(event, roomID);
       return;
@@ -1309,12 +1333,12 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
 
     if (event.isRedaction()) {
       this.logger.debug("Matrix timeline event received", {
-        eventID: event.getId(),
+        eventId: event.getId(),
         eventType: event.getType(),
-        roomID,
+        roomId: roomID,
       });
       this.logger.debug("Processing redaction event", {
-        eventID: event.getId(),
+        eventId: event.getId(),
         redacts: event.getAssociatedId(),
       });
       this.handleReactionRedaction(event);
@@ -1328,9 +1352,9 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       return;
     }
     this.logger.debug("Matrix timeline event received", {
-      eventID: event.getId(),
+      eventId: event.getId(),
       eventType: event.getType(),
-      roomID,
+      roomId: roomID,
       sender: event.getSender(),
     });
 
@@ -1341,8 +1365,8 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     const threadID = this.threadIDForEvent(event, roomID);
     const message = this.parseMessage(event);
     this.logger.debug("Dispatching Matrix message to Chat SDK", {
-      eventID: event.getId(),
-      threadID,
+      eventId: event.getId(),
+      threadId: threadID,
       isMention: message.isMention,
     });
 
@@ -1352,7 +1376,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     if (slash) {
       this.logger.debug("Dispatching slash command", {
         command: slash.command,
-        threadID,
+        threadId: threadID,
       });
       chat.processSlashCommand({
         adapter: this,
@@ -1390,7 +1414,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       return;
     }
 
-    const threadID = this.encodeThreadId({ roomID });
+    const threadID = this.resolveReactionThreadID(roomID, targetEventID);
     const emoji = getEmoji(key);
 
     const reactionEventID = event.getId();
@@ -1415,6 +1439,16 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       user: this.makeUser(sender),
       raw: event,
     });
+  }
+
+  private resolveReactionThreadID(roomID: string, relatedEventID: string): string {
+    const room = this.requireClient().getRoom(roomID);
+    const relatedEvent = room?.findEventById(relatedEventID);
+    if (!relatedEvent) {
+      return this.encodeThreadId({ roomID });
+    }
+
+    return this.threadIDForEvent(relatedEvent, roomID);
   }
 
   private handleReactionRedaction(event: MatrixEvent): void {
@@ -1466,18 +1500,15 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       return [];
     }
 
-    return [
-      {
-        type: "file" as const,
-        url,
-        mimeType:
-          typeof content.info === "object" &&
-          content.info !== null &&
-          typeof (content.info as { mimetype?: unknown }).mimetype === "string"
-            ? (content.info as { mimetype: string }).mimetype
-            : undefined,
-      },
-    ];
+    const info = isRecord(content.info) ? content.info : undefined;
+    const mimeType = typeof info?.mimetype === "string" ? info.mimetype : undefined;
+    const attachment: { type: "file"; url: string; mimeType?: string } = {
+      type: "file",
+      url,
+      mimeType,
+    };
+
+    return [attachment];
   }
 
   private isEdited(event: MatrixEvent): boolean {
@@ -1529,7 +1560,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
 
   private toRoomMessageContent(
     message: AdapterPostableMessage
-  ): { body: string; msgtype: MsgType } {
+  ): MatrixTextMessageContent {
     const body = this.toText(message);
 
     return {
@@ -1724,27 +1755,29 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
 
     try {
       const decryptedJSON = this.sessionConfig.decrypt(session.encryptedPayload);
-      const parsed = JSON.parse(decryptedJSON) as StoredSession;
+      const parsed: unknown = JSON.parse(decryptedJSON);
+      if (!this.isValidStoredSession(parsed)) {
+        return null;
+      }
       return parsed;
     } catch (error) {
       this.logger.warn("Failed to decrypt persisted Matrix session", {
-        error: String(error),
+        error,
       });
       return null;
     }
   }
 
   private isValidStoredSession(value: unknown): value is StoredSession {
-    if (!value || typeof value !== "object") {
+    if (!isRecord(value)) {
       return false;
     }
 
-    const session = value as Partial<StoredSession>;
     return (
-      typeof session.accessToken === "string" &&
-      typeof session.userID === "string" &&
-      typeof session.baseURL === "string" &&
-      session.baseURL === this.baseURL
+      typeof value.accessToken === "string" &&
+      typeof value.userID === "string" &&
+      typeof value.baseURL === "string" &&
+      value.baseURL === this.baseURL
     );
   }
 
@@ -1882,10 +1915,10 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       return;
     }
 
-    const loggerWithSetLevel = matrixSDKLogger as unknown as {
-      setLevel?: (level: number, persist?: boolean) => void;
-    };
-    loggerWithSetLevel.setLevel?.(numericLevel, false);
+    const setLevel = Reflect.get(matrixSDKLogger, "setLevel");
+    if (typeof setLevel === "function") {
+      setLevel.call(matrixSDKLogger, numericLevel, false);
+    }
     matrixSDKLogConfigured = true;
   }
 }
@@ -1915,6 +1948,10 @@ export function createMatrixAdapter(config?: MatrixAdapterConfig): MatrixAdapter
   return new MatrixAdapter({
     baseURL,
     auth,
+    userName:
+      process.env.MATRIX_BOT_USERNAME ??
+      process.env.MOM_BOT_USERNAME ??
+      "bot",
     deviceID: normalizeOptionalString(process.env.MATRIX_DEVICE_ID),
     deviceIDPersistence: {
       enabled: envBool(process.env.MATRIX_DEVICE_ID_PERSIST_ENABLED, true),
@@ -2062,4 +2099,8 @@ function parseSDKLogLevel(
     return normalized;
   }
   return undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }

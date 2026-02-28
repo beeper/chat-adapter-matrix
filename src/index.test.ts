@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { getEmoji } from "chat";
-import { EventType, RelationType } from "matrix-js-sdk";
+import type { ChatInstance, StateAdapter } from "chat";
+import { EventType, RelationType, type MatrixClient } from "matrix-js-sdk";
 import { encodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key";
 import { createMatrixAdapter, MatrixAdapter } from "./index";
 
@@ -62,9 +63,9 @@ function mapRawToEvent(raw: Record<string, unknown>) {
     getContent: () => content,
     getRelation: () =>
       relationType
-        ? ({
+        ? {
             rel_type: relationType,
-          } as never)
+          }
         : null,
     isRelation: (expectedRelType: string) => relationType === expectedRelType,
     getServerAggregatedRelation: (expectedRelType: string) =>
@@ -98,6 +99,48 @@ type RelationsResponseLike = {
   nextBatch: string | null;
   prevBatch: string | null;
 };
+
+type RoomLike = {
+  roomId: string;
+  name: string;
+  timeline: unknown[];
+  getJoinedMembers: () => Array<Record<string, never>>;
+  getMyMembership: () => string;
+  findEventById: (eventID?: string) => ReturnType<typeof makeEvent> | null;
+};
+
+type AdapterInternals = {
+  deviceID?: string;
+  e2eeConfig?: { enabled?: boolean };
+  getSecretStorageKeyFromRecoveryKey: (opts: {
+    keys: Record<string, unknown>;
+  }) => [string, Uint8Array] | null;
+  loadPersistedSession: () => Promise<{
+    accessToken: string;
+    userID: string;
+    deviceID?: string;
+  } | null>;
+  persistSession: (session: {
+    accessToken: string;
+    deviceID?: string;
+    userID: string;
+  }) => Promise<void>;
+  resolveAuth: () => Promise<{
+    accessToken: string;
+    userID: string;
+    deviceID?: string;
+  }>;
+  resolveDeviceID: () => Promise<void>;
+  stateAdapter: StateAdapter | null;
+};
+
+function asMatrixClient(client: ReturnType<typeof makeClient>): MatrixClient {
+  return client as unknown as MatrixClient;
+}
+
+function getInternals(adapter: MatrixAdapter): AdapterInternals {
+  return adapter as unknown as AdapterInternals;
+}
 
 function makeClient() {
   const handlers = new Map<string, (...args: unknown[]) => void>();
@@ -135,13 +178,13 @@ function makeClient() {
     ),
     setAccountData: vi.fn(async (): Promise<Record<string, never>> => ({})),
     decryptEventIfNeeded: vi.fn(async () => undefined),
-    getRoom: vi.fn(() => ({
+    getRoom: vi.fn((): RoomLike => ({
       roomId: "!room:beeper.com",
       name: "Example Room",
       timeline: [],
       getJoinedMembers: () => [{}, {}],
       getMyMembership: () => "join",
-      findEventById: () => makeEvent({ getId: () => "$sent" }),
+      findEventById: (_eventID?: string) => makeEvent({ getId: () => "$sent" }),
     })),
     __handlers: handlers,
   };
@@ -149,7 +192,7 @@ function makeClient() {
   return client;
 }
 
-function makeStateAdapter(initial: Record<string, unknown> = {}) {
+function makeStateAdapter(initial: Record<string, unknown> = {}): StateAdapter {
   const store = new Map<string, unknown>(Object.entries(initial));
   return {
     acquireLock: vi.fn(async () => null),
@@ -167,7 +210,7 @@ function makeStateAdapter(initial: Record<string, unknown> = {}) {
     }),
     subscribe: vi.fn(async () => undefined),
     unsubscribe: vi.fn(async () => undefined),
-  };
+  } as StateAdapter;
 }
 
 function markSyncReady(client: ReturnType<typeof makeClient>) {
@@ -188,7 +231,14 @@ function decodeCursorToken(cursor: string): {
   return JSON.parse(Buffer.from(cursor.slice(5), "base64url").toString("utf8"));
 }
 
-function makeChatInstance(overrides: Record<string, unknown> = {}) {
+function requireValue<T>(value: T | null | undefined, label: string): T {
+  if (value === null || value === undefined) {
+    throw new Error(`Expected ${label} to be present`);
+  }
+  return value;
+}
+
+function makeChatInstance(overrides: Record<string, unknown> = {}): ChatInstance {
   return {
     getLogger: () =>
       ({
@@ -196,8 +246,8 @@ function makeChatInstance(overrides: Record<string, unknown> = {}) {
         info: vi.fn(),
         warn: vi.fn(),
         error: vi.fn(),
-        child: () => ({}) as never,
-      }) as never,
+        child: () => ({}),
+      }),
     getState: vi.fn(),
     getUserName: vi.fn(),
     handleIncomingMessage: vi.fn(),
@@ -211,7 +261,7 @@ function makeChatInstance(overrides: Record<string, unknown> = {}) {
     processReaction: vi.fn(),
     processSlashCommand: vi.fn(),
     ...overrides,
-  };
+  } as unknown as ChatInstance;
 }
 
 describe("MatrixAdapter", () => {
@@ -247,13 +297,13 @@ describe("MatrixAdapter", () => {
         accessToken: "token",
         userID: "@bot:beeper.com",
       },
-      createClient: () => fakeClient as never,
+      createClient: () => asMatrixClient(fakeClient),
     });
 
     const processMessage = vi.fn();
     const processSlashCommand = vi.fn();
 
-    await adapter.initialize(makeChatInstance({ processMessage, processSlashCommand }) as never);
+    await adapter.initialize(makeChatInstance({ processMessage, processSlashCommand }));
 
     const timelineHandler = fakeClient.__handlers.get("Room.timeline");
     expect(timelineHandler).toBeTruthy();
@@ -288,10 +338,10 @@ describe("MatrixAdapter", () => {
         accessToken: "token",
         userID: "@bot:beeper.com",
       },
-      createClient: () => fakeClient as never,
+      createClient: () => asMatrixClient(fakeClient),
     });
 
-    await adapter.initialize(makeChatInstance({ processReaction }) as never);
+    await adapter.initialize(makeChatInstance({ processReaction }));
 
     const timelineHandler = fakeClient.__handlers.get("Room.timeline");
     markSyncReady(fakeClient);
@@ -336,6 +386,64 @@ describe("MatrixAdapter", () => {
     });
   });
 
+  it("routes reactions to thread context when target event belongs to a thread", async () => {
+    const fakeClient = makeClient();
+    fakeClient.getRoom.mockReturnValue({
+      roomId: "!room:beeper.com",
+      name: "Example Room",
+      timeline: [],
+      getJoinedMembers: () => [{}, {}],
+      getMyMembership: () => "join",
+      findEventById: (eventId?: string) =>
+        eventId === "$target"
+          ? makeEvent({
+              getId: () => "$target",
+              getRoomId: () => "!room:beeper.com",
+              threadRootId: "$root",
+            })
+          : null,
+    });
+
+    const processReaction = vi.fn();
+    const adapter = new MatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: {
+        type: "accessToken",
+        accessToken: "token",
+        userID: "@bot:beeper.com",
+      },
+      createClient: () => asMatrixClient(fakeClient),
+    });
+    await adapter.initialize(makeChatInstance({ processReaction }));
+
+    const timelineHandler = fakeClient.__handlers.get("Room.timeline");
+    markSyncReady(fakeClient);
+    timelineHandler?.(
+      makeEvent({
+        getId: () => "$reaction2",
+        getType: () => EventType.Reaction,
+        getContent: () => ({
+          "m.relates_to": {
+            rel_type: RelationType.Annotation,
+            event_id: "$target",
+            key: "🔥",
+          },
+        }),
+      }),
+      { roomId: "!room:beeper.com" },
+      false
+    );
+    await Promise.resolve();
+
+    expect(processReaction).toHaveBeenCalledOnce();
+    expect(processReaction.mock.calls[0][0]).toMatchObject({
+      threadId: "matrix:!room%3Abeeper.com:%24root",
+      messageId: "$target",
+      emoji: getEmoji("🔥"),
+      added: true,
+    });
+  });
+
   it("initializes rust crypto and decrypts encrypted events when e2ee is enabled", async () => {
     const fakeClient = makeClient();
     const processMessage = vi.fn();
@@ -348,11 +456,11 @@ describe("MatrixAdapter", () => {
         userID: "@bot:beeper.com",
       },
       deviceID: "DEVICE1",
-      createClient: () => fakeClient as never,
+      createClient: () => asMatrixClient(fakeClient),
       e2ee: { enabled: true },
     });
 
-    await adapter.initialize(makeChatInstance({ processMessage }) as never);
+    await adapter.initialize(makeChatInstance({ processMessage }));
 
     expect(fakeClient.initRustCrypto).toHaveBeenCalledOnce();
 
@@ -372,15 +480,17 @@ describe("MatrixAdapter", () => {
   });
 
   it("enables e2ee when recovery key is provided", () => {
-    const adapter = createMatrixAdapter({
-      baseURL: "https://hs.beeper.com",
-      auth: {
-        type: "accessToken",
-        accessToken: "token",
-        userID: "@bot:beeper.com",
-      },
-      recoveryKey: "s3cr3t-recovery-key",
-    }) as unknown as { e2eeConfig?: { enabled?: boolean } };
+    const adapter = getInternals(
+      createMatrixAdapter({
+        baseURL: "https://hs.beeper.com",
+        auth: {
+          type: "accessToken",
+          accessToken: "token",
+          userID: "@bot:beeper.com",
+        },
+        recoveryKey: "s3cr3t-recovery-key",
+      })
+    );
 
     expect(adapter.e2eeConfig?.enabled).toBe(true);
   });
@@ -388,20 +498,19 @@ describe("MatrixAdapter", () => {
   it("decodes recovery key for secret storage callback", () => {
     const recoveryKey = encodeRecoveryKey(new Uint8Array(32).fill(7));
     expect(recoveryKey).toBeDefined();
+    const validatedRecoveryKey = requireValue(recoveryKey, "recoveryKey");
 
-    const adapter = createMatrixAdapter({
-      baseURL: "https://hs.beeper.com",
-      auth: {
-        type: "accessToken",
-        accessToken: "token",
-        userID: "@bot:beeper.com",
-      },
-      recoveryKey: recoveryKey!,
-    }) as unknown as {
-      getSecretStorageKeyFromRecoveryKey: (opts: {
-        keys: Record<string, unknown>;
-      }) => [string, Uint8Array] | null;
-    };
+    const adapter = getInternals(
+      createMatrixAdapter({
+        baseURL: "https://hs.beeper.com",
+        auth: {
+          type: "accessToken",
+          accessToken: "token",
+          userID: "@bot:beeper.com",
+        },
+        recoveryKey: validatedRecoveryKey,
+      })
+    );
 
     const result = adapter.getSecretStorageKeyFromRecoveryKey({
       keys: {
@@ -423,12 +532,10 @@ describe("MatrixAdapter", () => {
         accessToken: "token",
         userID: "@bot:beeper.com",
       },
-      createClient: () => fakeClient as never,
+      createClient: () => asMatrixClient(fakeClient),
     });
 
-    await adapter.initialize(
-      makeChatInstance({ getState: vi.fn(() => makeStateAdapter() as never) }) as never
-    );
+    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter()) }));
 
     await adapter.editMessage(
       "matrix:!room%3Abeeper.com",
@@ -442,6 +549,7 @@ describe("MatrixAdapter", () => {
       expect.objectContaining({
         "com.beeper.dont_render_edited": true,
         "m.new_content": {
+          "com.beeper.dont_render_edited": true,
           msgtype: "m.text",
           body: "updated body",
         },
@@ -454,20 +562,18 @@ describe("MatrixAdapter", () => {
   });
 
   it("generates and persists a device id when one is not provided", async () => {
-    const adapter = new MatrixAdapter({
-      baseURL: "https://hs.beeper.com",
-      auth: {
-        type: "accessToken",
-        accessToken: "token",
-        userID: "@bot:beeper.com",
-      },
-    }) as unknown as {
-      stateAdapter: unknown;
-      resolveDeviceID: () => Promise<void>;
-      deviceID?: string;
-    };
+    const adapter = getInternals(
+      new MatrixAdapter({
+        baseURL: "https://hs.beeper.com",
+        auth: {
+          type: "accessToken",
+          accessToken: "token",
+          userID: "@bot:beeper.com",
+        },
+      })
+    );
     const state = makeStateAdapter();
-    adapter.stateAdapter = state as unknown;
+    adapter.stateAdapter = state;
 
     await adapter.resolveDeviceID();
 
@@ -482,20 +588,18 @@ describe("MatrixAdapter", () => {
         persistedDeviceID,
     });
 
-    const adapter = new MatrixAdapter({
-      baseURL: "https://hs.beeper.com",
-      auth: {
-        type: "accessToken",
-        accessToken: "token",
-        userID: "@bot:beeper.com",
-      },
-      deviceID: "   ",
-    }) as unknown as {
-      stateAdapter: unknown;
-      resolveDeviceID: () => Promise<void>;
-      deviceID?: string;
-    };
-    adapter.stateAdapter = state as unknown;
+    const adapter = getInternals(
+      new MatrixAdapter({
+        baseURL: "https://hs.beeper.com",
+        auth: {
+          type: "accessToken",
+          accessToken: "token",
+          userID: "@bot:beeper.com",
+        },
+        deviceID: "   ",
+      })
+    );
+    adapter.stateAdapter = state;
 
     await adapter.resolveDeviceID();
 
@@ -524,10 +628,10 @@ describe("MatrixAdapter", () => {
         accessToken: "token",
         userID: "@bot:beeper.com",
       },
-      createClient: () => fakeClient as never,
+      createClient: () => asMatrixClient(fakeClient),
     });
 
-    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter() as never) }) as never);
+    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter()) }));
 
     await adapter.shutdown();
     expect(fakeClient.stopClient).toHaveBeenCalledOnce();
@@ -537,41 +641,24 @@ describe("MatrixAdapter", () => {
     const baseURL = "https://hs.beeper.com";
     const state = makeStateAdapter();
 
-    const adapter = new MatrixAdapter({
+    const adapter = getInternals(new MatrixAdapter({
       baseURL,
       auth: {
         type: "password",
         username: "bot",
         password: "secret",
       },
-    });
+    }));
 
-    (adapter as unknown as { stateAdapter: unknown }).stateAdapter =
-      state as unknown;
+    adapter.stateAdapter = state;
 
-    await (
-      adapter as unknown as {
-        persistSession: (session: {
-          accessToken: string;
-          deviceID?: string;
-          userID: string;
-        }) => Promise<void>;
-      }
-    ).persistSession({
+    await adapter.persistSession({
       accessToken: "persisted-token",
       userID: "@bot:beeper.com",
       deviceID: "DEVICE1",
     });
 
-    const restored = await (
-      adapter as unknown as {
-        loadPersistedSession: () => Promise<{
-          accessToken: string;
-          userID: string;
-          deviceID?: string;
-        } | null>;
-      }
-    ).loadPersistedSession();
+    const restored = await adapter.loadPersistedSession();
 
     expect(state.set).toHaveBeenCalled();
     expect(restored).toMatchObject({
@@ -619,20 +706,12 @@ describe("MatrixAdapter", () => {
         ({
           loginWithPassword,
           whoami,
-        }) as never,
+        }),
     });
 
-    (adapter as unknown as { stateAdapter: unknown }).stateAdapter =
-      state as unknown;
-    const resolved = await (
-      adapter as unknown as {
-        resolveAuth: () => Promise<{
-          accessToken: string;
-          userID: string;
-          deviceID?: string;
-        }>;
-      }
-    ).resolveAuth();
+    const internals = getInternals(adapter);
+    internals.stateAdapter = state;
+    const resolved = await internals.resolveAuth();
 
     expect(resolved).toMatchObject({
       accessToken: "persisted-token",
@@ -679,20 +758,12 @@ describe("MatrixAdapter", () => {
         ({
           loginWithPassword,
           whoami,
-        }) as never,
+        }),
     });
 
-    (adapter as unknown as { stateAdapter: unknown }).stateAdapter =
-      state as unknown;
-    const resolved = await (
-      adapter as unknown as {
-        resolveAuth: () => Promise<{
-          accessToken: string;
-          userID: string;
-          deviceID?: string;
-        }>;
-      }
-    ).resolveAuth();
+    const internals = getInternals(adapter);
+    internals.stateAdapter = state;
+    const resolved = await internals.resolveAuth();
 
     expect(loginWithPassword).toHaveBeenCalledOnce();
     expect(resolved).toMatchObject({
@@ -725,20 +796,12 @@ describe("MatrixAdapter", () => {
           loginRequest,
           loginWithPassword,
           whoami: vi.fn(),
-        }) as never,
+        }),
     });
 
-    (adapter as unknown as { stateAdapter: unknown }).stateAdapter =
-      makeStateAdapter() as unknown;
-    const resolved = await (
-      adapter as unknown as {
-        resolveAuth: () => Promise<{
-          accessToken: string;
-          userID: string;
-          deviceID?: string;
-        }>;
-      }
-    ).resolveAuth();
+    const internals = getInternals(adapter);
+    internals.stateAdapter = makeStateAdapter();
+    const resolved = await internals.resolveAuth();
 
     expect(loginRequest).toHaveBeenCalledOnce();
     expect(loginRequest).toHaveBeenCalledWith(
@@ -775,20 +838,12 @@ describe("MatrixAdapter", () => {
         ({
           whoami,
           loginWithPassword: vi.fn(),
-        }) as never,
+        }),
     });
 
-    (adapter as unknown as { stateAdapter: unknown }).stateAdapter =
-      makeStateAdapter() as unknown;
-    const resolved = await (
-      adapter as unknown as {
-        resolveAuth: () => Promise<{
-          accessToken: string;
-          userID: string;
-          deviceID?: string;
-        }>;
-      }
-    ).resolveAuth();
+    const internals = getInternals(adapter);
+    internals.stateAdapter = makeStateAdapter();
+    const resolved = await internals.resolveAuth();
 
     expect(whoami).toHaveBeenCalledOnce();
     expect(resolved).toMatchObject({
@@ -803,9 +858,9 @@ describe("MatrixAdapter", () => {
     const adapter = new MatrixAdapter({
       baseURL: "https://hs.beeper.com",
       auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
-      createClient: () => fakeClient as never,
+      createClient: () => asMatrixClient(fakeClient),
     });
-    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter() as never) }) as never);
+    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter()) }));
 
     await expect(
       adapter.fetchMessages("matrix:!room%3Abeeper.com", { cursor: "$legacy_cursor" })
@@ -846,9 +901,9 @@ describe("MatrixAdapter", () => {
     const adapter = new MatrixAdapter({
       baseURL: "https://hs.beeper.com",
       auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
-      createClient: () => fakeClient as never,
+      createClient: () => asMatrixClient(fakeClient),
     });
-    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter() as never) }) as never);
+    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter()) }));
 
     const firstPage = await adapter.fetchMessages("matrix:!room%3Abeeper.com", {
       direction: "backward",
@@ -860,7 +915,9 @@ describe("MatrixAdapter", () => {
       "$top2",
     ]);
     expect(firstPage.nextCursor).toBeTruthy();
-    const decoded = decodeCursorToken(firstPage.nextCursor!);
+    const decoded = decodeCursorToken(
+      requireValue(firstPage.nextCursor, "firstPage.nextCursor")
+    );
     expect(decoded).toMatchObject({
       kind: "room_messages",
       token: "room-page-token-1",
@@ -924,9 +981,9 @@ describe("MatrixAdapter", () => {
     const adapter = new MatrixAdapter({
       baseURL: "https://hs.beeper.com",
       auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
-      createClient: () => fakeClient as never,
+      createClient: () => asMatrixClient(fakeClient),
     });
-    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter() as never) }) as never);
+    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter()) }));
 
     const page = await adapter.fetchMessages(
       "matrix:!room%3Abeeper.com:%24root",
@@ -942,7 +999,9 @@ describe("MatrixAdapter", () => {
       true
     );
     expect(page.nextCursor).toBeTruthy();
-    expect(decodeCursorToken(page.nextCursor!)).toMatchObject({
+    expect(
+      decodeCursorToken(requireValue(page.nextCursor, "thread page nextCursor"))
+    ).toMatchObject({
       kind: "thread_relations",
       token: "thread-page-token-1",
       roomID: "!room:beeper.com",
@@ -975,9 +1034,9 @@ describe("MatrixAdapter", () => {
     const adapter = new MatrixAdapter({
       baseURL: "https://hs.beeper.com",
       auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
-      createClient: () => fakeClient as never,
+      createClient: () => asMatrixClient(fakeClient),
     });
-    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter() as never) }) as never);
+    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter()) }));
 
     const result = await adapter.fetchChannelMessages?.("matrix:!room%3Abeeper.com", {
       direction: "backward",
@@ -986,7 +1045,8 @@ describe("MatrixAdapter", () => {
 
     expect(result?.messages.map((message) => message.id)).toEqual(["$top"]);
     expect(result?.nextCursor).toBeTruthy();
-    expect(decodeCursorToken(result!.nextCursor!)).toMatchObject({
+    const nextCursor = requireValue(result?.nextCursor, "channel nextCursor");
+    expect(decodeCursorToken(nextCursor)).toMatchObject({
       kind: "room_messages",
       token: "channel-page-token-1",
       roomID: "!room:beeper.com",
@@ -998,9 +1058,9 @@ describe("MatrixAdapter", () => {
     const adapter = new MatrixAdapter({
       baseURL: "https://hs.beeper.com",
       auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
-      createClient: () => fakeClient as never,
+      createClient: () => asMatrixClient(fakeClient),
     });
-    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter() as never) }) as never);
+    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter()) }));
 
     fakeClient.fetchRoomEvent
       .mockResolvedValueOnce(
@@ -1038,9 +1098,9 @@ describe("MatrixAdapter", () => {
     const adapterFromCache = new MatrixAdapter({
       baseURL: "https://hs.beeper.com",
       auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
-      createClient: () => fakeClient as never,
+      createClient: () => asMatrixClient(fakeClient),
     });
-    await adapterFromCache.initialize(makeChatInstance({ getState: vi.fn(() => cachedState as never) }) as never);
+    await adapterFromCache.initialize(makeChatInstance({ getState: vi.fn(() => cachedState) }));
     const cachedThread = await adapterFromCache.openDM("@bob:beeper.com");
     expect(cachedThread).toBe("matrix:!cached-dm%3Abeeper.com");
     expect(fakeClient.createRoom).not.toHaveBeenCalled();
@@ -1052,9 +1112,9 @@ describe("MatrixAdapter", () => {
     const adapterFromDirect = new MatrixAdapter({
       baseURL: "https://hs.beeper.com",
       auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
-      createClient: () => fakeClient as never,
+      createClient: () => asMatrixClient(fakeClient),
     });
-    await adapterFromDirect.initialize(makeChatInstance({ getState: vi.fn(() => directState as never) }) as never);
+    await adapterFromDirect.initialize(makeChatInstance({ getState: vi.fn(() => directState) }));
     const directThread = await adapterFromDirect.openDM("@bob:beeper.com");
     expect(directThread).toBe("matrix:!from-direct%3Abeeper.com");
     expect(directState.set).toHaveBeenCalledWith(
@@ -1069,9 +1129,9 @@ describe("MatrixAdapter", () => {
     const adapterCreate = new MatrixAdapter({
       baseURL: "https://hs.beeper.com",
       auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
-      createClient: () => fakeClient as never,
+      createClient: () => asMatrixClient(fakeClient),
     });
-    await adapterCreate.initialize(makeChatInstance({ getState: vi.fn(() => createState as never) }) as never);
+    await adapterCreate.initialize(makeChatInstance({ getState: vi.fn(() => createState) }));
     const createdThread = await adapterCreate.openDM("@bob:beeper.com");
     expect(createdThread).toBe("matrix:!created-dm%3Abeeper.com");
     expect(fakeClient.createRoom).toHaveBeenCalledWith({
@@ -1124,9 +1184,9 @@ describe("MatrixAdapter", () => {
     const adapter = new MatrixAdapter({
       baseURL: "https://hs.beeper.com",
       auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
-      createClient: () => fakeClient as never,
+      createClient: () => asMatrixClient(fakeClient),
     });
-    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter() as never) }) as never);
+    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter()) }));
 
     const result = await adapter.listThreads("matrix:!room%3Abeeper.com", { limit: 2 });
 
@@ -1136,7 +1196,9 @@ describe("MatrixAdapter", () => {
     ]);
     expect(result.threads.map((thread) => thread.replyCount)).toEqual([4, 2]);
     expect(result.nextCursor).toBeTruthy();
-    expect(decodeCursorToken(result.nextCursor!)).toMatchObject({
+    expect(
+      decodeCursorToken(requireValue(result.nextCursor, "thread list nextCursor"))
+    ).toMatchObject({
       kind: "thread_list",
       token: "thread-list-page-token-1",
       roomID: "!room:beeper.com",
