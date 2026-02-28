@@ -414,6 +414,45 @@ describe("MatrixAdapter", () => {
     expect(result?.[1]).toBeInstanceOf(Uint8Array);
   });
 
+  it("sends Matrix edit payload with dont_render_edited context", async () => {
+    const fakeClient = makeClient();
+    const adapter = new MatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: {
+        type: "accessToken",
+        accessToken: "token",
+        userID: "@bot:beeper.com",
+      },
+      createClient: () => fakeClient as never,
+    });
+
+    await adapter.initialize(
+      makeChatInstance({ getState: vi.fn(() => makeStateAdapter() as never) }) as never
+    );
+
+    await adapter.editMessage(
+      "matrix:!room%3Abeeper.com",
+      "$original",
+      "updated body"
+    );
+
+    expect(fakeClient.sendEvent).toHaveBeenCalledWith(
+      "!room:beeper.com",
+      EventType.RoomMessage,
+      expect.objectContaining({
+        "com.beeper.dont_render_edited": true,
+        "m.new_content": {
+          msgtype: "m.text",
+          body: "updated body",
+        },
+        "m.relates_to": {
+          rel_type: RelationType.Replace,
+          event_id: "$original",
+        },
+      })
+    );
+  });
+
   it("generates and persists a device id when one is not provided", async () => {
     const adapter = new MatrixAdapter({
       baseURL: "https://hs.beeper.com",

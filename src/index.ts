@@ -355,6 +355,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     const baseContent = this.toRoomMessageContent(message);
 
     const response = await this.sendRoomMessage(roomID, rootEventID, {
+      "com.beeper.dont_render_edited": true,
       "m.new_content": {
         msgtype: baseContent.msgtype,
         body: baseContent.body,
