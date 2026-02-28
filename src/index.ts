@@ -26,14 +26,19 @@ import {
   stringifyMarkdown,
 } from "chat";
 import sdk, {
+  Direction,
   type MatrixClient,
   type MatrixEvent,
+  type IEvent,
+  type IThreadBundledRelationship,
   type Room,
   ClientEvent,
   EventType,
   MsgType,
   RelationType,
   RoomEvent,
+  ThreadFilterType,
+  THREAD_RELATION_TYPE,
 } from "matrix-js-sdk";
 import { decodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key";
 import { logger as matrixSDKLogger } from "matrix-js-sdk/lib/logger";
@@ -47,7 +52,9 @@ import type {
 
 const MATRIX_PREFIX = "matrix";
 const MATRIX_DEVICE_PREFIX = "matrix:device";
+const MATRIX_DM_PREFIX = "matrix:dm";
 const MATRIX_SESSION_PREFIX = "matrix:session";
+const MATRIX_CURSOR_PREFIX = "mxv1:";
 const DEFAULT_COMMAND_PREFIX = "/";
 const TYPING_TIMEOUT_MS = 30_000;
 const FAST_SYNC_DEFAULTS: NonNullable<MatrixAdapterConfig["sync"]> = {
@@ -107,6 +114,21 @@ type DeviceIDPersistenceConfig = {
   key?: string;
 };
 
+type CursorKind = "room_messages" | "thread_relations" | "thread_list";
+
+type CursorDirection = "forward" | "backward";
+
+type CursorV1Payload = {
+  dir: CursorDirection;
+  kind: CursorKind;
+  roomID: string;
+  rootEventID?: string;
+  token: string;
+};
+
+type DirectAccountData = Record<string, string[]>;
+
+// Intentionally unsupported in this adapter: postEphemeral, openModal, and native stream.
 export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   readonly name = "matrix";
   readonly userName: string;
@@ -297,30 +319,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   }
 
   parseMessage(raw: MatrixEvent): Message<MatrixEvent> {
-    const roomID = raw.getRoomId();
-    if (!roomID) {
-      throw new Error("Matrix event missing room ID");
-    }
-
-    const threadID = this.threadIDForEvent(raw, roomID);
-    const content = raw.getContent<MatrixMessageContent>();
-    const text = this.extractText(content);
-    const sender = raw.getSender() ?? "unknown";
-
-    return new Message<MatrixEvent>({
-      id: raw.getId() ?? `${roomID}:${raw.getTs()}`,
-      threadId: threadID,
-      text,
-      formatted: parseMarkdown(text),
-      author: this.makeUser(sender),
-      metadata: {
-        dateSent: new Date(raw.getTs()),
-        edited: this.isEdited(raw),
-      },
-      attachments: this.extractAttachments(content),
-      raw,
-      isMention: this.isMentioned(content, text),
-    });
+    return this.parseMessageInternal(raw);
   }
 
   async postMessage(
@@ -428,47 +427,148 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     await this.requireClient().sendTyping(roomID, true, TYPING_TIMEOUT_MS);
   }
 
+  async openDM(userId: string): Promise<string> {
+    const cachedRoomID = await this.loadPersistedDMRoomID(userId);
+    if (cachedRoomID) {
+      return this.encodeThreadId({ roomID: cachedRoomID });
+    }
+
+    const direct = await this.loadDirectAccountData();
+    const existingRoomID = this.findExistingDirectRoomID(direct, userId);
+    if (existingRoomID) {
+      await this.persistDMRoomID(userId, existingRoomID);
+      return this.encodeThreadId({ roomID: existingRoomID });
+    }
+
+    const response = await this.requireClient().createRoom({
+      invite: [userId],
+      is_direct: true,
+    });
+
+    const createdRoomID = response.room_id;
+    if (!createdRoomID) {
+      throw new Error("Matrix createRoom did not return room_id for DM.");
+    }
+
+    await this.persistDMRoomID(userId, createdRoomID);
+    await this.persistDirectAccountDataRoom(userId, createdRoomID, direct);
+    return this.encodeThreadId({ roomID: createdRoomID });
+  }
+
   async fetchMessages(
     threadId: string,
     options: FetchOptions = {}
   ): Promise<FetchResult<MatrixEvent>> {
     const { roomID, rootEventID } = this.decodeThreadId(threadId);
-    const room = this.requireRoom(roomID);
-
-    const messageEvents = room.timeline.filter((event) =>
-      this.isMessageEvent(event, roomID, rootEventID)
-    );
-
     const direction = options.direction ?? "backward";
     const limit = options.limit ?? 50;
+    const cursor = options.cursor
+      ? this.decodeCursorV1(
+          options.cursor,
+          rootEventID ? "thread_relations" : "room_messages",
+          roomID,
+          rootEventID
+        )
+      : null;
 
-    if (direction === "forward") {
-      const startIndex = options.cursor
-        ? messageEvents.findIndex((e) => e.getId() === options.cursor) + 1
-        : 0;
-
-      const slice = messageEvents.slice(startIndex, startIndex + limit);
-      const last = slice.at(-1)?.getId();
-      const hasMore = startIndex + limit < messageEvents.length;
+    if (!rootEventID) {
+      const response = await this.fetchRoomMessagesPage({
+        roomID,
+        includeThreadReplies: false,
+        limit,
+        direction,
+        fromToken: cursor?.token ?? null,
+      });
 
       return {
-        messages: slice.map((event) => this.parseMessage(event)),
-        nextCursor: hasMore ? last : undefined,
+        messages: response.events.map((event) => this.parseMessageInternal(event)),
+        nextCursor: response.nextToken
+          ? this.encodeCursorV1({
+              kind: "room_messages",
+              dir: direction,
+              token: response.nextToken,
+              roomID,
+            })
+          : undefined,
       };
     }
 
-    const endIndex = options.cursor
-      ? messageEvents.findIndex((e) => e.getId() === options.cursor)
-      : messageEvents.length;
-
-    const boundedEnd = endIndex >= 0 ? endIndex : messageEvents.length;
-    const start = Math.max(0, boundedEnd - limit);
-    const slice = messageEvents.slice(start, boundedEnd);
+    const includeRoot = !cursor;
+    const response = await this.fetchThreadMessagesPage({
+      roomID,
+      rootEventID,
+      includeRoot,
+      limit,
+      direction,
+      fromToken: cursor?.token ?? null,
+    });
 
     return {
-      messages: slice.map((event) => this.parseMessage(event)),
-      nextCursor: start > 0 ? messageEvents[start - 1]?.getId() : undefined,
+      messages: response.events.map((event) =>
+        this.parseMessageInternal(event, this.encodeThreadId({ roomID, rootEventID }))
+      ),
+      nextCursor: response.nextToken
+        ? this.encodeCursorV1({
+            kind: "thread_relations",
+            dir: direction,
+            token: response.nextToken,
+            roomID,
+            rootEventID,
+          })
+        : undefined,
     };
+  }
+
+  async fetchChannelMessages(
+    channelId: string,
+    options: FetchOptions = {}
+  ): Promise<FetchResult<MatrixEvent>> {
+    const roomID = this.decodeChannelID(channelId);
+    const direction = options.direction ?? "backward";
+    const limit = options.limit ?? 50;
+    const cursor = options.cursor
+      ? this.decodeCursorV1(options.cursor, "room_messages", roomID)
+      : null;
+
+    const response = await this.fetchRoomMessagesPage({
+      roomID,
+      includeThreadReplies: false,
+      limit,
+      direction,
+      fromToken: cursor?.token ?? null,
+    });
+
+    return {
+      messages: response.events.map((event) => this.parseMessageInternal(event)),
+      nextCursor: response.nextToken
+        ? this.encodeCursorV1({
+            kind: "room_messages",
+            dir: direction,
+            token: response.nextToken,
+            roomID,
+          })
+        : undefined,
+    };
+  }
+
+  async fetchMessage(
+    threadId: string,
+    messageId: string
+  ): Promise<Message<MatrixEvent> | null> {
+    const { roomID, rootEventID } = this.decodeThreadId(threadId);
+    const event = await this.fetchRoomEventMapped(roomID, messageId);
+    if (!event) {
+      return null;
+    }
+
+    if (!this.isMessageEventInContext(event, roomID, rootEventID)) {
+      return null;
+    }
+
+    const overrideThreadID = rootEventID
+      ? this.encodeThreadId({ roomID, rootEventID })
+      : undefined;
+    return this.parseMessageInternal(event, overrideThreadID);
   }
 
   async fetchThread(threadId: string): Promise<ThreadInfo> {
@@ -506,64 +606,382 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     options: ListThreadsOptions = {}
   ): Promise<ListThreadsResult<MatrixEvent>> {
     const roomID = this.decodeChannelID(channelId);
-    const room = this.requireRoom(roomID);
-
-    const threadMap = new Map<
-      string,
-      {
-        root?: MatrixEvent;
-        replyCount: number;
-        lastTS?: number;
-      }
-    >();
-
-    for (const event of room.timeline) {
-      if (event.getType() !== EventType.RoomMessage) {
-        continue;
-      }
-
-      const rootID = event.threadRootId;
-      if (!rootID) {
-        continue;
-      }
-
-      const entry = threadMap.get(rootID) ?? { replyCount: 0 };
-
-      if (event.getId() === rootID) {
-        entry.root = event;
-      } else {
-        entry.replyCount += 1;
-      }
-
-      entry.lastTS = Math.max(entry.lastTS ?? 0, event.getTs());
-      threadMap.set(rootID, entry);
-    }
-
+    const direction: CursorDirection = "backward";
+    const limit = options.limit ?? 50;
+    const cursor = options.cursor
+      ? this.decodeCursorV1(options.cursor, "thread_list", roomID)
+      : null;
+    const listResponse = await this.requireClient().createThreadListMessagesRequest(
+      roomID,
+      cursor?.token ?? null,
+      limit,
+      Direction.Backward,
+      ThreadFilterType.All
+    );
+    const events = await this.mapRawEvents(listResponse.chunk ?? [], roomID);
     const summaries: ThreadSummary<MatrixEvent>[] = [];
-    for (const [rootID, entry] of threadMap.entries()) {
-      if (!entry.root) {
+
+    for (const rootEvent of events) {
+      const rootID = rootEvent.getId();
+      if (!rootID || rootEvent.getType() !== EventType.RoomMessage) {
         continue;
       }
+
+      const bundled = rootEvent.getServerAggregatedRelation<IThreadBundledRelationship>(
+        THREAD_RELATION_TYPE.name
+      );
+      const latestTS = bundled?.latest_event?.origin_server_ts;
+      const threadID = this.encodeThreadId({ roomID, rootEventID: rootID });
 
       summaries.push({
-        id: this.encodeThreadId({ roomID, rootEventID: rootID }),
-        rootMessage: this.parseMessage(entry.root),
-        replyCount: entry.replyCount,
-        lastReplyAt: entry.lastTS ? new Date(entry.lastTS) : undefined,
+        id: threadID,
+        rootMessage: this.parseMessageInternal(rootEvent, threadID),
+        replyCount: bundled?.count ?? 0,
+        lastReplyAt: typeof latestTS === "number" ? new Date(latestTS) : undefined,
       });
     }
 
-    summaries.sort(
-      (a, b) =>
-        (b.lastReplyAt?.getTime() ?? 0) - (a.lastReplyAt?.getTime() ?? 0)
-    );
+    return {
+      threads: summaries,
+      nextCursor: listResponse.end
+        ? this.encodeCursorV1({
+            kind: "thread_list",
+            dir: direction,
+            token: listResponse.end,
+            roomID,
+          })
+        : undefined,
+    };
+  }
 
-    const limit = options.limit ?? 50;
+  private parseMessageInternal(
+    raw: MatrixEvent,
+    overrideThreadID?: string
+  ): Message<MatrixEvent> {
+    const roomID = raw.getRoomId();
+    if (!roomID) {
+      throw new Error("Matrix event missing room ID");
+    }
+
+    const threadID = overrideThreadID ?? this.threadIDForEvent(raw, roomID);
+    const content = raw.getContent<MatrixMessageContent>();
+    const text = this.extractText(content);
+    const sender = raw.getSender() ?? "unknown";
+
+    return new Message<MatrixEvent>({
+      id: raw.getId() ?? `${roomID}:${raw.getTs()}`,
+      threadId: threadID,
+      text,
+      formatted: parseMarkdown(text),
+      author: this.makeUser(sender),
+      metadata: {
+        dateSent: new Date(raw.getTs()),
+        edited: this.isEdited(raw),
+      },
+      attachments: this.extractAttachments(content),
+      raw,
+      isMention: this.isMentioned(content, text),
+    });
+  }
+
+  private encodeCursorV1(payload: CursorV1Payload): string {
+    return `${MATRIX_CURSOR_PREFIX}${Buffer.from(
+      JSON.stringify(payload),
+      "utf8"
+    ).toString("base64url")}`;
+  }
+
+  private decodeCursorV1(
+    cursor: string,
+    expectedKind: CursorKind,
+    expectedRoomID: string,
+    expectedRootEventID?: string
+  ): CursorV1Payload {
+    if (!cursor.startsWith(MATRIX_CURSOR_PREFIX)) {
+      throw new Error("Invalid cursor format. Expected mxv1 cursor.");
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(
+        Buffer.from(cursor.slice(MATRIX_CURSOR_PREFIX.length), "base64url").toString("utf8")
+      );
+    } catch (error) {
+      throw new Error(`Invalid cursor format. ${String(error)}`);
+    }
+
+    if (!parsed || typeof parsed !== "object") {
+      throw new Error("Invalid cursor format. Cursor payload must be an object.");
+    }
+
+    const payload = parsed as Partial<CursorV1Payload>;
+    if (payload.kind !== expectedKind) {
+      throw new Error(`Invalid cursor kind. Expected ${expectedKind}.`);
+    }
+    if (payload.roomID !== expectedRoomID) {
+      throw new Error("Invalid cursor context. Room mismatch.");
+    }
+    if (
+      payload.dir !== "forward" &&
+      payload.dir !== "backward"
+    ) {
+      throw new Error("Invalid cursor format. Invalid direction.");
+    }
+    if (!payload.token || typeof payload.token !== "string") {
+      throw new Error("Invalid cursor format. Missing token.");
+    }
+
+    if (expectedRootEventID) {
+      if (payload.rootEventID !== expectedRootEventID) {
+        throw new Error("Invalid cursor context. Thread mismatch.");
+      }
+    } else if (payload.rootEventID) {
+      throw new Error("Invalid cursor context. Unexpected thread scope.");
+    }
+
+    return payload as CursorV1Payload;
+  }
+
+  private async fetchRoomMessagesPage(args: {
+    roomID: string;
+    includeThreadReplies: boolean;
+    limit: number;
+    direction: CursorDirection;
+    fromToken: string | null;
+  }): Promise<{ events: MatrixEvent[]; nextToken: string | null }> {
+    const response = await this.requireClient().createMessagesRequest(
+      args.roomID,
+      args.fromToken,
+      args.limit,
+      args.direction === "forward" ? Direction.Forward : Direction.Backward
+    );
+    const events = await this.mapRawEvents(response.chunk ?? [], args.roomID);
+    const filtered = events.filter((event) => {
+      if (event.getType() !== EventType.RoomMessage) {
+        return false;
+      }
+      if (event.getRoomId() !== args.roomID) {
+        return false;
+      }
+      if (args.includeThreadReplies) {
+        return true;
+      }
+      return this.isTopLevelMessageEvent(event);
+    });
 
     return {
-      threads: summaries.slice(0, limit),
-      nextCursor: summaries.length > limit ? String(limit) : undefined,
+      events: this.sortEventsChronologically(filtered),
+      nextToken: response.end ?? null,
     };
+  }
+
+  private async fetchThreadMessagesPage(args: {
+    roomID: string;
+    rootEventID: string;
+    includeRoot: boolean;
+    limit: number;
+    direction: CursorDirection;
+    fromToken: string | null;
+  }): Promise<{ events: MatrixEvent[]; nextToken: string | null }> {
+    const relationLimit = args.includeRoot
+      ? Math.max(args.limit - 1, 1)
+      : args.limit;
+
+    const relationResponse = await this.requireClient().relations(
+      args.roomID,
+      args.rootEventID,
+      THREAD_RELATION_TYPE.name,
+      null,
+      {
+        dir: args.direction === "forward" ? Direction.Forward : Direction.Backward,
+        from: args.fromToken ?? undefined,
+        limit: relationLimit,
+      }
+    );
+
+    await Promise.all(
+      relationResponse.events.map((event) => this.tryDecryptEvent(event))
+    );
+    const replies = this.sortEventsChronologically(
+      relationResponse.events.filter((event) =>
+        this.isMessageEventInContext(event, args.roomID, args.rootEventID)
+      )
+    );
+
+    if (!args.includeRoot) {
+      return {
+        events: replies.slice(0, args.limit),
+        nextToken: relationResponse.nextBatch ?? null,
+      };
+    }
+
+    const rootEvent =
+      relationResponse.originalEvent?.getId() === args.rootEventID
+        ? relationResponse.originalEvent
+        : await this.fetchRoomEventMapped(args.roomID, args.rootEventID);
+    const rootArray =
+      rootEvent &&
+      this.isMessageEventInContext(rootEvent, args.roomID, args.rootEventID)
+        ? [rootEvent]
+        : [];
+    const dedupedReplies = replies.filter(
+      (event) => event.getId() !== args.rootEventID
+    );
+
+    return {
+      events: [...rootArray, ...dedupedReplies].slice(0, args.limit),
+      nextToken: relationResponse.nextBatch ?? null,
+    };
+  }
+
+  private async mapRawEvents(
+    rawEvents: Array<Partial<IEvent>>,
+    roomID: string
+  ): Promise<MatrixEvent[]> {
+    const events = rawEvents.map((event) => this.mapRawEvent(event, roomID));
+    await Promise.all(events.map((event) => this.tryDecryptEvent(event)));
+    return events;
+  }
+
+  private mapRawEvent(rawEvent: Partial<IEvent>, roomID: string): MatrixEvent {
+    const mapper = this.requireClient().getEventMapper();
+    const withRoomID = rawEvent.room_id
+      ? rawEvent
+      : { ...rawEvent, room_id: roomID };
+    return mapper(withRoomID);
+  }
+
+  private async fetchRoomEventMapped(
+    roomID: string,
+    eventID: string
+  ): Promise<MatrixEvent | null> {
+    try {
+      const rawEvent = await this.requireClient().fetchRoomEvent(roomID, eventID);
+      if (!rawEvent) {
+        return null;
+      }
+
+      const mapped = this.mapRawEvent(rawEvent, roomID);
+      await this.tryDecryptEvent(mapped);
+      return mapped;
+    } catch {
+      return null;
+    }
+  }
+
+  private sortEventsChronologically(events: MatrixEvent[]): MatrixEvent[] {
+    const deduped = new Map<string, MatrixEvent>();
+    const withoutIDs: MatrixEvent[] = [];
+
+    for (const event of events) {
+      const eventID = event.getId();
+      if (!eventID) {
+        withoutIDs.push(event);
+        continue;
+      }
+      deduped.set(eventID, event);
+    }
+
+    return [...deduped.values(), ...withoutIDs].sort((a, b) => {
+      const tsDiff = a.getTs() - b.getTs();
+      if (tsDiff !== 0) {
+        return tsDiff;
+      }
+      return (a.getId() ?? "").localeCompare(b.getId() ?? "");
+    });
+  }
+
+  private isTopLevelMessageEvent(event: MatrixEvent): boolean {
+    return !event.threadRootId && !event.isRelation(THREAD_RELATION_TYPE.name);
+  }
+
+  private isMessageEventInContext(
+    event: MatrixEvent,
+    roomID: string,
+    rootEventID?: string
+  ): boolean {
+    if (event.getType() !== EventType.RoomMessage || event.getRoomId() !== roomID) {
+      return false;
+    }
+
+    if (!rootEventID) {
+      return this.isTopLevelMessageEvent(event);
+    }
+
+    return event.threadRootId === rootEventID || event.getId() === rootEventID;
+  }
+
+  private getDMStorageKey(userID: string): string {
+    return `${MATRIX_DM_PREFIX}:${encodeURIComponent(userID)}`;
+  }
+
+  private async loadPersistedDMRoomID(userID: string): Promise<string | null> {
+    if (!this.stateAdapter) {
+      return null;
+    }
+
+    const cached = await this.stateAdapter.get<string | null>(
+      this.getDMStorageKey(userID)
+    );
+    const normalized = normalizeOptionalString(cached ?? undefined);
+    return normalized ?? null;
+  }
+
+  private async persistDMRoomID(userID: string, roomID: string): Promise<void> {
+    if (!this.stateAdapter) {
+      return;
+    }
+
+    await this.stateAdapter.set(this.getDMStorageKey(userID), roomID);
+  }
+
+  private async loadDirectAccountData(): Promise<DirectAccountData> {
+    const direct = await this.requireClient().getAccountDataFromServer(EventType.Direct);
+    return this.normalizeDirectAccountData(direct);
+  }
+
+  private normalizeDirectAccountData(value: unknown): DirectAccountData {
+    if (!value || typeof value !== "object") {
+      return {};
+    }
+
+    const out: DirectAccountData = {};
+    for (const [userID, roomIDs] of Object.entries(value)) {
+      if (!Array.isArray(roomIDs)) {
+        continue;
+      }
+      out[userID] = roomIDs.filter(
+        (roomID): roomID is string => typeof roomID === "string" && roomID.length > 0
+      );
+    }
+
+    return out;
+  }
+
+  private findExistingDirectRoomID(
+    direct: DirectAccountData,
+    userID: string
+  ): string | null {
+    const candidates = direct[userID] ?? [];
+    for (const roomID of candidates) {
+      if (roomID) {
+        return roomID;
+      }
+    }
+    return null;
+  }
+
+  private async persistDirectAccountDataRoom(
+    userID: string,
+    roomID: string,
+    existing: DirectAccountData
+  ): Promise<void> {
+    const updated: DirectAccountData = { ...existing };
+    const existingRooms = updated[userID] ?? [];
+    if (!existingRooms.includes(roomID)) {
+      updated[userID] = [...existingRooms, roomID];
+      await this.requireClient().setAccountData(EventType.Direct, updated);
+    }
   }
 
   private async resolveAuth(): Promise<ResolvedAuth> {

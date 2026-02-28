@@ -13,6 +13,8 @@ function makeEvent(overrides: Record<string, unknown> = {}) {
     getType: () => EventType.RoomMessage,
     getContent: () => ({ body: "hello" }),
     getRelation: () => null,
+    isRelation: () => false,
+    getServerAggregatedRelation: () => undefined,
     threadRootId: undefined,
     isThreadRoot: false,
     isRedaction: () => false,
@@ -22,6 +24,80 @@ function makeEvent(overrides: Record<string, unknown> = {}) {
 
   return event;
 }
+
+function makeRawEvent(overrides: Record<string, unknown> = {}) {
+  return {
+    event_id: "$raw",
+    room_id: "!room:beeper.com",
+    origin_server_ts: 1_700_000_000_000,
+    sender: "@alice:beeper.com",
+    type: EventType.RoomMessage,
+    content: { body: "hello" },
+    unsigned: {},
+    ...overrides,
+  };
+}
+
+function mapRawToEvent(raw: Record<string, unknown>) {
+  const content = (raw.content as Record<string, unknown> | undefined) ?? {};
+  const relatesTo = content["m.relates_to"] as
+    | Record<string, unknown>
+    | undefined;
+  const relationType = relatesTo?.rel_type;
+  const relationEventID = relatesTo?.event_id;
+  const mappedThreadRootId =
+    typeof raw.threadRootId === "string"
+      ? raw.threadRootId
+      : relationType === "m.thread" && typeof relationEventID === "string"
+        ? relationEventID
+        : undefined;
+  const isThreadRoot = raw.isThreadRoot === true;
+
+  return makeEvent({
+    getId: () => (raw.event_id as string | undefined) ?? "$raw",
+    getRoomId: () => (raw.room_id as string | undefined) ?? "!room:beeper.com",
+    getTs: () => (raw.origin_server_ts as number | undefined) ?? 1_700_000_000_000,
+    getSender: () => (raw.sender as string | undefined) ?? "@alice:beeper.com",
+    getType: () => (raw.type as string | undefined) ?? EventType.RoomMessage,
+    getContent: () => content,
+    getRelation: () =>
+      relationType
+        ? ({
+            rel_type: relationType,
+          } as never)
+        : null,
+    isRelation: (expectedRelType: string) => relationType === expectedRelType,
+    getServerAggregatedRelation: (expectedRelType: string) =>
+      ((raw.unsigned as Record<string, unknown> | undefined)?.[
+        "m.relations"
+      ] as Record<string, unknown> | undefined)?.[expectedRelType],
+    threadRootId: mappedThreadRootId,
+    isThreadRoot,
+  });
+}
+
+type RawEventLike = {
+  content?: Record<string, unknown>;
+  event_id?: string;
+  origin_server_ts?: number;
+  room_id?: string;
+  sender?: string;
+  type?: string;
+  unsigned?: Record<string, unknown>;
+  [key: string]: unknown;
+};
+
+type MessagesResponseLike = {
+  chunk: RawEventLike[];
+  end?: string;
+};
+
+type RelationsResponseLike = {
+  originalEvent: ReturnType<typeof makeEvent> | null;
+  events: Array<ReturnType<typeof makeEvent>>;
+  nextBatch: string | null;
+  prevBatch: string | null;
+};
 
 function makeClient() {
   const handlers = new Map<string, (...args: unknown[]) => void>();
@@ -36,13 +112,35 @@ function makeClient() {
     sendEvent: vi.fn(async () => ({ event_id: "$reaction" })),
     redactEvent: vi.fn(async () => ({ event_id: "$redaction" })),
     sendTyping: vi.fn(async () => ({})),
+    createRoom: vi.fn(async () => ({ room_id: "!new-dm:beeper.com" })),
+    createMessagesRequest: vi.fn(
+      async (): Promise<MessagesResponseLike> => ({ chunk: [], end: undefined })
+    ),
+    createThreadListMessagesRequest: vi.fn(
+      async (): Promise<MessagesResponseLike> => ({ chunk: [], end: undefined })
+    ),
+    fetchRoomEvent: vi.fn(async (): Promise<RawEventLike | null> => null),
+    getAccountDataFromServer: vi.fn(
+      async (): Promise<Record<string, string[]> | null> => null
+    ),
+    getEventMapper: vi.fn(() => (raw: Record<string, unknown>) => mapRawToEvent(raw)),
     initRustCrypto: vi.fn(async () => undefined),
+    relations: vi.fn(
+      async (): Promise<RelationsResponseLike> => ({
+        originalEvent: null,
+        events: [],
+        nextBatch: null,
+        prevBatch: null,
+      })
+    ),
+    setAccountData: vi.fn(async (): Promise<Record<string, never>> => ({})),
     decryptEventIfNeeded: vi.fn(async () => undefined),
     getRoom: vi.fn(() => ({
       roomId: "!room:beeper.com",
       name: "Example Room",
       timeline: [],
       getJoinedMembers: () => [{}, {}],
+      getMyMembership: () => "join",
       findEventById: () => makeEvent({ getId: () => "$sent" }),
     })),
     __handlers: handlers,
@@ -75,6 +173,19 @@ function makeStateAdapter(initial: Record<string, unknown> = {}) {
 function markSyncReady(client: ReturnType<typeof makeClient>) {
   const syncHandler = client.__handlers.get("sync");
   syncHandler?.("PREPARED");
+}
+
+function decodeCursorToken(cursor: string): {
+  dir: "forward" | "backward";
+  kind: string;
+  roomID: string;
+  rootEventID?: string;
+  token: string;
+} {
+  if (!cursor.startsWith("mxv1:")) {
+    throw new Error(`Expected mxv1 cursor, got: ${cursor}`);
+  }
+  return JSON.parse(Buffer.from(cursor.slice(5), "base64url").toString("utf8"));
 }
 
 function makeChatInstance(overrides: Record<string, unknown> = {}) {
@@ -432,7 +543,7 @@ describe("MatrixAdapter", () => {
 
     expect(state.set).toHaveBeenCalledWith(
       "matrix:session:https%3A%2F%2Fhs.beeper.com:username:bot",
-      expect.any(Object),
+      expect.objectContaining({}),
       undefined
     );
   });
@@ -645,6 +756,352 @@ describe("MatrixAdapter", () => {
       accessToken: "token",
       userID: "@bot:beeper.com",
       deviceID: "DEVICE_FROM_WHOAMI",
+    });
+  });
+
+  it("rejects legacy cursors for API pagination", async () => {
+    const fakeClient = makeClient();
+    const adapter = new MatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
+      createClient: () => fakeClient as never,
+    });
+    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter() as never) }) as never);
+
+    await expect(
+      adapter.fetchMessages("matrix:!room%3Abeeper.com", { cursor: "$legacy_cursor" })
+    ).rejects.toThrow("Invalid cursor format. Expected mxv1 cursor.");
+  });
+
+  it("fetches non-thread messages via matrix API with mxv1 cursor", async () => {
+    const fakeClient = makeClient();
+    fakeClient.createMessagesRequest
+      .mockResolvedValueOnce({
+        chunk: [
+          makeRawEvent({
+            event_id: "$top2",
+            origin_server_ts: 1_700_000_000_200,
+            content: { body: "top-2" },
+          }),
+          makeRawEvent({
+            event_id: "$reply1",
+            origin_server_ts: 1_700_000_000_100,
+            content: {
+              body: "reply-1",
+              "m.relates_to": { rel_type: "m.thread", event_id: "$root" },
+            },
+          }),
+          makeRawEvent({
+            event_id: "$top1",
+            origin_server_ts: 1_700_000_000_050,
+            content: { body: "top-1" },
+          }),
+        ],
+        end: "room-page-token-1",
+      })
+      .mockResolvedValueOnce({
+        chunk: [],
+        end: undefined,
+      });
+
+    const adapter = new MatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
+      createClient: () => fakeClient as never,
+    });
+    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter() as never) }) as never);
+
+    const firstPage = await adapter.fetchMessages("matrix:!room%3Abeeper.com", {
+      direction: "backward",
+      limit: 10,
+    });
+
+    expect(firstPage.messages.map((message) => message.id)).toEqual([
+      "$top1",
+      "$top2",
+    ]);
+    expect(firstPage.nextCursor).toBeTruthy();
+    const decoded = decodeCursorToken(firstPage.nextCursor!);
+    expect(decoded).toMatchObject({
+      kind: "room_messages",
+      token: "room-page-token-1",
+      roomID: "!room:beeper.com",
+      dir: "backward",
+    });
+
+    await adapter.fetchMessages("matrix:!room%3Abeeper.com", {
+      direction: "backward",
+      limit: 10,
+      cursor: firstPage.nextCursor,
+    });
+    expect(fakeClient.createMessagesRequest).toHaveBeenNthCalledWith(
+      2,
+      "!room:beeper.com",
+      "room-page-token-1",
+      10,
+      "b"
+    );
+  });
+
+  it("fetches thread messages via relations and includes root on first page", async () => {
+    const fakeClient = makeClient();
+    fakeClient.relations.mockResolvedValue({
+      originalEvent: null,
+      events: [
+        makeEvent({
+          getId: () => "$reply2",
+          getTs: () => 1_700_000_000_400,
+          getRoomId: () => "!room:beeper.com",
+          getContent: () => ({
+            body: "reply-2",
+            "m.relates_to": { rel_type: "m.thread", event_id: "$root" },
+          }),
+          threadRootId: "$root",
+          isRelation: () => true,
+        }),
+        makeEvent({
+          getId: () => "$reply1",
+          getTs: () => 1_700_000_000_300,
+          getRoomId: () => "!room:beeper.com",
+          getContent: () => ({
+            body: "reply-1",
+            "m.relates_to": { rel_type: "m.thread", event_id: "$root" },
+          }),
+          threadRootId: "$root",
+          isRelation: () => true,
+        }),
+      ],
+      nextBatch: "thread-page-token-1",
+      prevBatch: null,
+    });
+    fakeClient.fetchRoomEvent.mockResolvedValue(
+      makeRawEvent({
+        event_id: "$root",
+        origin_server_ts: 1_700_000_000_100,
+        content: { body: "root" },
+      })
+    );
+
+    const adapter = new MatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
+      createClient: () => fakeClient as never,
+    });
+    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter() as never) }) as never);
+
+    const page = await adapter.fetchMessages(
+      "matrix:!room%3Abeeper.com:%24root",
+      { direction: "forward", limit: 3 }
+    );
+
+    expect(page.messages.map((message) => message.id)).toEqual([
+      "$root",
+      "$reply1",
+      "$reply2",
+    ]);
+    expect(page.messages.every((message) => message.threadId.endsWith(":%24root"))).toBe(
+      true
+    );
+    expect(page.nextCursor).toBeTruthy();
+    expect(decodeCursorToken(page.nextCursor!)).toMatchObject({
+      kind: "thread_relations",
+      token: "thread-page-token-1",
+      roomID: "!room:beeper.com",
+      rootEventID: "$root",
+      dir: "forward",
+    });
+  });
+
+  it("fetches channel-level messages through fetchChannelMessages", async () => {
+    const fakeClient = makeClient();
+    fakeClient.createMessagesRequest.mockResolvedValue({
+      chunk: [
+        makeRawEvent({
+          event_id: "$reply",
+          origin_server_ts: 1_700_000_000_200,
+          content: {
+            body: "reply",
+            "m.relates_to": { rel_type: "m.thread", event_id: "$root" },
+          },
+        }),
+        makeRawEvent({
+          event_id: "$top",
+          origin_server_ts: 1_700_000_000_050,
+          content: { body: "top" },
+        }),
+      ],
+      end: "channel-page-token-1",
+    });
+
+    const adapter = new MatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
+      createClient: () => fakeClient as never,
+    });
+    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter() as never) }) as never);
+
+    const result = await adapter.fetchChannelMessages?.("matrix:!room%3Abeeper.com", {
+      direction: "backward",
+      limit: 20,
+    });
+
+    expect(result?.messages.map((message) => message.id)).toEqual(["$top"]);
+    expect(result?.nextCursor).toBeTruthy();
+    expect(decodeCursorToken(result!.nextCursor!)).toMatchObject({
+      kind: "room_messages",
+      token: "channel-page-token-1",
+      roomID: "!room:beeper.com",
+    });
+  });
+
+  it("fetches a single message in context and returns null for mismatches", async () => {
+    const fakeClient = makeClient();
+    const adapter = new MatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
+      createClient: () => fakeClient as never,
+    });
+    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter() as never) }) as never);
+
+    fakeClient.fetchRoomEvent
+      .mockResolvedValueOnce(
+        makeRawEvent({
+          event_id: "$root",
+          origin_server_ts: 1_700_000_000_000,
+          content: { body: "root" },
+        })
+      )
+      .mockResolvedValueOnce(
+        makeRawEvent({
+          event_id: "$reply-other-thread",
+          origin_server_ts: 1_700_000_000_000,
+          content: {
+            body: "wrong thread",
+            "m.relates_to": { rel_type: "m.thread", event_id: "$another-root" },
+          },
+        })
+      );
+    const message = await adapter.fetchMessage?.("matrix:!room%3Abeeper.com:%24root", "$root");
+    expect(message?.id).toBe("$root");
+    expect(message?.threadId).toBe("matrix:!room%3Abeeper.com:%24root");
+    const mismatch = await adapter.fetchMessage?.(
+      "matrix:!room%3Abeeper.com:%24root",
+      "$reply-other-thread"
+    );
+    expect(mismatch).toBeNull();
+  });
+
+  it("openDM reuses cached mapping, then m.direct mapping, then creates and persists", async () => {
+    const fakeClient = makeClient();
+    const cachedState = makeStateAdapter({
+      "matrix:dm:%40bob%3Abeeper.com": "!cached-dm:beeper.com",
+    });
+    const adapterFromCache = new MatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
+      createClient: () => fakeClient as never,
+    });
+    await adapterFromCache.initialize(makeChatInstance({ getState: vi.fn(() => cachedState as never) }) as never);
+    const cachedThread = await adapterFromCache.openDM("@bob:beeper.com");
+    expect(cachedThread).toBe("matrix:!cached-dm%3Abeeper.com");
+    expect(fakeClient.createRoom).not.toHaveBeenCalled();
+
+    const directState = makeStateAdapter();
+    fakeClient.getAccountDataFromServer.mockResolvedValue({
+      "@bob:beeper.com": ["!from-direct:beeper.com"],
+    });
+    const adapterFromDirect = new MatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
+      createClient: () => fakeClient as never,
+    });
+    await adapterFromDirect.initialize(makeChatInstance({ getState: vi.fn(() => directState as never) }) as never);
+    const directThread = await adapterFromDirect.openDM("@bob:beeper.com");
+    expect(directThread).toBe("matrix:!from-direct%3Abeeper.com");
+    expect(directState.set).toHaveBeenCalledWith(
+      "matrix:dm:%40bob%3Abeeper.com",
+      "!from-direct:beeper.com"
+    );
+
+    const createState = makeStateAdapter();
+    fakeClient.getAccountDataFromServer.mockResolvedValue({});
+    fakeClient.createRoom.mockResolvedValue({ room_id: "!created-dm:beeper.com" });
+    fakeClient.setAccountData.mockResolvedValue({});
+    const adapterCreate = new MatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
+      createClient: () => fakeClient as never,
+    });
+    await adapterCreate.initialize(makeChatInstance({ getState: vi.fn(() => createState as never) }) as never);
+    const createdThread = await adapterCreate.openDM("@bob:beeper.com");
+    expect(createdThread).toBe("matrix:!created-dm%3Abeeper.com");
+    expect(fakeClient.createRoom).toHaveBeenCalledWith({
+      invite: ["@bob:beeper.com"],
+      is_direct: true,
+    });
+    expect(fakeClient.setAccountData).toHaveBeenCalledWith(EventType.Direct, {
+      "@bob:beeper.com": ["!created-dm:beeper.com"],
+    });
+    expect(createState.set).toHaveBeenCalledWith(
+      "matrix:dm:%40bob%3Abeeper.com",
+      "!created-dm:beeper.com"
+    );
+  });
+
+  it("lists threads using server-side thread API with mxv1 cursor", async () => {
+    const fakeClient = makeClient();
+    fakeClient.createThreadListMessagesRequest.mockResolvedValue({
+      chunk: [
+        makeRawEvent({
+          event_id: "$root2",
+          origin_server_ts: 1_700_000_000_200,
+          content: { body: "Root 2" },
+          unsigned: {
+            "m.relations": {
+              "m.thread": {
+                count: 4,
+                latest_event: { origin_server_ts: 1_700_000_000_900 },
+              },
+            },
+          },
+        }),
+        makeRawEvent({
+          event_id: "$root1",
+          origin_server_ts: 1_700_000_000_100,
+          content: { body: "Root 1" },
+          unsigned: {
+            "m.relations": {
+              "m.thread": {
+                count: 2,
+                latest_event: { origin_server_ts: 1_700_000_000_500 },
+              },
+            },
+          },
+        }),
+      ],
+      end: "thread-list-page-token-1",
+    });
+
+    const adapter = new MatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
+      createClient: () => fakeClient as never,
+    });
+    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter() as never) }) as never);
+
+    const result = await adapter.listThreads("matrix:!room%3Abeeper.com", { limit: 2 });
+
+    expect(result.threads.map((thread) => thread.id)).toEqual([
+      "matrix:!room%3Abeeper.com:%24root2",
+      "matrix:!room%3Abeeper.com:%24root1",
+    ]);
+    expect(result.threads.map((thread) => thread.replyCount)).toEqual([4, 2]);
+    expect(result.nextCursor).toBeTruthy();
+    expect(decodeCursorToken(result.nextCursor!)).toMatchObject({
+      kind: "thread_list",
+      token: "thread-list-page-token-1",
+      roomID: "!room:beeper.com",
+      dir: "backward",
     });
   });
 });
