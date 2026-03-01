@@ -38,6 +38,7 @@ export interface MatrixAdapterConfig {
   deviceIDPersistence?: MatrixDeviceIDPersistenceConfig;
   deviceID?: string;
   e2ee?: MatrixE2EEConfig;
+  inviteAutoJoin?: MatrixInviteAutoJoinConfig;
   logger?: Logger;
   matrixSDKLogLevel?: "trace" | "debug" | "info" | "warn" | "error";
   recoveryKey?: string;
@@ -45,6 +46,11 @@ export interface MatrixAdapterConfig {
   session?: MatrixSessionConfig;
   sync?: IStartClientOpts;
   userName?: string;
+}
+
+export interface MatrixInviteAutoJoinConfig {
+  enabled?: boolean;
+  inviterAllowlist?: string[];
 }
 
 export interface MatrixThreadID {

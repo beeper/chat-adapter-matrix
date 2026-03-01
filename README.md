@@ -74,8 +74,35 @@ Common optional:
 - `MATRIX_DEVICE_ID`
 - `MATRIX_RECOVERY_KEY`
 - `MATRIX_BOT_USERNAME` (mention detection display name, defaults to `MOM_BOT_USERNAME` then `bot`)
+- `MATRIX_INVITE_AUTOJOIN_ENABLED` (`true`/`false`; defaults to `true` when invite allowlist is set, otherwise `false`)
+- `MATRIX_INVITE_AUTOJOIN_ALLOWLIST` (comma-separated Matrix user IDs allowed to invite the bot, e.g. `@alice:beeper.com,@team-bot:beeper.com`)
 
 Advanced options are available for device/session persistence, E2EE storage, and SDK logging (`MATRIX_SDK_LOG_LEVEL`).
+
+## Invite Auto-Join
+
+Enable this when you want the bot to accept incoming room invites automatically.
+
+```ts
+createMatrixAdapter({
+  baseURL: process.env.MATRIX_BASE_URL!,
+  auth: {
+    type: "accessToken",
+    accessToken: process.env.MATRIX_ACCESS_TOKEN!,
+    userID: process.env.MATRIX_USER_ID,
+  },
+  inviteAutoJoin: {
+    enabled: true,
+    inviterAllowlist: ["@alice:beeper.com", "@ops:beeper.com"],
+  },
+});
+```
+
+Behavior:
+
+- Only `m.room.member` invites targeted at the bot user are considered.
+- If `inviterAllowlist` is set, only those inviters are accepted.
+- If `roomAllowlist` is also set, both checks must pass.
 
 ## Running The Example
 
@@ -110,6 +137,8 @@ bun --env-file=examples/.env run examples/bot.ts
 - `fetchMessage(threadId, messageId)` fetches a single message with thread/channel context validation.
 - `fetchChannelMessages(channelId, options)` fetches top-level room timeline messages.
 - `fetchMessages(threadId, options)` and `listThreads(channelId, options)` use API-first server pagination via `matrix-js-sdk`.
+- Outbound file support: `files` and binary `attachments` are uploaded with `uploadContent()` and sent as Matrix media messages.
+- URL-only attachments are appended as links in the text body.
 - `postEphemeral`, `openModal`, and native `stream` are not implemented by this adapter.
 
 ## Notes

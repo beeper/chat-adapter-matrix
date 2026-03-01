@@ -2,9 +2,11 @@ import { randomBytes } from "node:crypto";
 import type {
   Adapter,
   AdapterPostableMessage,
+  Attachment,
   ChannelInfo,
   ChatInstance,
   EmojiValue,
+  FileUpload,
   FetchOptions,
   FetchResult,
   FormattedContent,
@@ -143,6 +145,25 @@ type CursorV1Payload = {
 
 type DirectAccountData = Record<string, string[]>;
 
+type OutboundUpload = {
+  data: Blob;
+  fileName: string;
+  info?: {
+    h?: number;
+    mimetype?: string;
+    size?: number;
+    w?: number;
+  };
+  msgtype: MatrixMediaMsgType;
+  type?: string;
+};
+
+type MatrixMediaMsgType =
+  | MsgType.Audio
+  | MsgType.File
+  | MsgType.Image
+  | MsgType.Video;
+
 // Intentionally unsupported in this adapter: postEphemeral, openModal, and native stream.
 export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   readonly name = "matrix";
@@ -152,6 +173,8 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   private readonly auth: MatrixAuthConfig;
   private readonly commandPrefix: string;
   private readonly roomAllowlist?: Set<string>;
+  private readonly inviteAutoJoinEnabled: boolean;
+  private readonly inviteAutoJoinInviterAllowlist?: Set<string>;
   private readonly syncOptions?: MatrixAdapterConfig["sync"];
   private readonly createClientFn?: MatrixAdapterConfig["createClient"];
   private readonly createBootstrapClientFn?: MatrixAdapterConfig["createBootstrapClient"];
@@ -175,7 +198,6 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   private started = false;
   private userID: string;
   private deviceID?: string;
-  private botUserID?: string;
   private readonly reactionByEventID = new Map<string, StoredReaction>();
   private readonly myReactionByKey = new Map<string, string>();
   private readonly processedTimelineEventIDs = new Set<string>();
@@ -186,17 +208,22 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     this.validateConfig(config);
     this.baseURL = config.baseURL;
     this.auth = config.auth;
-    this.userID =
-      config.auth.type === "accessToken"
-        ? (config.auth.userID ?? "")
-        : (config.auth.userID ?? "");
-    this.botUserID = this.userID || undefined;
+    this.userID = config.auth.userID ?? "";
     this.deviceID = normalizeOptionalString(config.deviceID);
     this.userName = config.userName ?? "bot";
     this.commandPrefix = config.commandPrefix ?? DEFAULT_COMMAND_PREFIX;
     this.roomAllowlist = config.roomAllowlist
       ? new Set(config.roomAllowlist)
       : undefined;
+    const inviteAutoJoinInviterAllowlist = normalizeStringList(
+      config.inviteAutoJoin?.inviterAllowlist
+    );
+    this.inviteAutoJoinEnabled =
+      config.inviteAutoJoin?.enabled ?? Boolean(config.inviteAutoJoin);
+    this.inviteAutoJoinInviterAllowlist =
+      inviteAutoJoinInviterAllowlist.length > 0
+        ? new Set(inviteAutoJoinInviterAllowlist)
+        : undefined;
     this.syncOptions = config.sync ?? FAST_SYNC_DEFAULTS;
     this.createClientFn = config.createClient;
     this.createBootstrapClientFn = config.createBootstrapClient;
@@ -241,7 +268,6 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     } else {
       const resolvedAuth = await this.resolveAuth();
       this.userID = resolvedAuth.userID;
-      this.botUserID = resolvedAuth.userID;
       this.deviceID = normalizeOptionalString(resolvedAuth.deviceID) ?? this.deviceID;
       this.client = this.buildClient(resolvedAuth);
     }
@@ -274,7 +300,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   }
 
   get botUserId(): string | undefined {
-    return this.botUserID;
+    return this.userID || undefined;
   }
 
   async shutdown(): Promise<void> {
@@ -326,7 +352,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
 
   channelIdFromThreadId(threadId: string): string {
     const { roomID } = this.decodeThreadId(threadId);
-    return `${MATRIX_PREFIX}:${encodeURIComponent(roomID)}`;
+    return this.encodeThreadId({ roomID });
   }
 
   renderFormatted(content: FormattedContent): string {
@@ -342,9 +368,14 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     message: AdapterPostableMessage
   ): Promise<RawMessage<MatrixEvent>> {
     const { roomID, rootEventID } = this.decodeThreadId(threadId);
-    const content = this.toRoomMessageContent(message);
-
-    const response = await this.sendRoomMessage(roomID, rootEventID, content);
+    const contents = await this.toRoomMessageContents(message);
+    const [firstContent, ...extraContents] = contents;
+    const primaryContent =
+      firstContent ?? ({ body: "", msgtype: MsgType.Text } as MatrixRoomMessageContent);
+    const response = await this.sendRoomMessage(roomID, rootEventID, primaryContent);
+    for (const content of extraContents) {
+      await this.sendRoomMessage(roomID, rootEventID, content);
+    }
 
     return {
       id: response.event_id,
@@ -439,6 +470,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
 
     const { roomID } = this.decodeThreadId(threadId);
     await this.requireClient().redactEvent(roomID, reactionEventID);
+    this.myReactionByKey.delete(this.myReactionKey(threadId, messageId, rawEmoji));
   }
 
   async startTyping(threadId: string): Promise<void> {
@@ -543,31 +575,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     options: FetchOptions = {}
   ): Promise<FetchResult<MatrixEvent>> {
     const roomID = this.decodeChannelID(channelId);
-    const direction = options.direction ?? "backward";
-    const limit = options.limit ?? 50;
-    const cursor = options.cursor
-      ? this.decodeCursorV1(options.cursor, "room_messages", roomID)
-      : null;
-
-    const response = await this.fetchRoomMessagesPage({
-      roomID,
-      includeThreadReplies: false,
-      limit,
-      direction,
-      fromToken: cursor?.token ?? null,
-    });
-
-    return {
-      messages: response.events.map((event) => this.parseMessageInternal(event)),
-      nextCursor: response.nextToken
-        ? this.encodeCursorV1({
-            kind: "room_messages",
-            dir: direction,
-            token: response.nextToken,
-            roomID,
-          })
-        : undefined,
-    };
+    return this.fetchMessages(this.encodeThreadId({ roomID }), options);
   }
 
   async fetchMessage(
@@ -766,6 +774,10 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     };
   }
 
+  private toSDKDirection(dir: CursorDirection): Direction {
+    return dir === "forward" ? Direction.Forward : Direction.Backward;
+  }
+
   private async fetchRoomMessagesPage(args: {
     roomID: string;
     includeThreadReplies: boolean;
@@ -777,7 +789,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       args.roomID,
       args.fromToken,
       args.limit,
-      args.direction === "forward" ? Direction.Forward : Direction.Backward
+      this.toSDKDirection(args.direction)
     );
     const events = await this.mapRawEvents(response.chunk ?? [], args.roomID);
     const filtered = events.filter((event) => {
@@ -817,7 +829,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       THREAD_RELATION_TYPE.name,
       null,
       {
-        dir: args.direction === "forward" ? Direction.Forward : Direction.Backward,
+        dir: this.toSDKDirection(args.direction),
         from: args.fromToken ?? undefined,
         limit: relationLimit,
       }
@@ -867,7 +879,11 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     rawEvents: Array<Partial<IEvent>>,
     roomID: string
   ): Promise<MatrixEvent[]> {
-    const events = rawEvents.map((event) => this.mapRawEvent(event, roomID));
+    const mapper = this.requireClient().getEventMapper();
+    const events = rawEvents.map((event) => {
+      const withRoomID = event.room_id ? event : { ...event, room_id: roomID };
+      return mapper(withRoomID);
+    });
     await Promise.all(events.map((event) => this.tryDecryptEvent(event)));
     return events;
   }
@@ -957,7 +973,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     const cached = await this.stateAdapter.get<string | null>(
       this.getDMStorageKey(userID)
     );
-    const normalized = normalizeOptionalString(cached ?? undefined);
+    const normalized = normalizeOptionalString(cached);
     return normalized ?? null;
   }
 
@@ -1088,11 +1104,6 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     return resolved;
   }
 
-  private async lookupUserIDFromAccessToken(accessToken: string): Promise<string> {
-    const whoami = await this.lookupWhoAmIFromAccessToken(accessToken);
-    return whoami.userID;
-  }
-
   private async lookupWhoAmIFromAccessToken(
     accessToken: string
   ): Promise<{ deviceID?: string; userID: string }> {
@@ -1168,6 +1179,49 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     }
 
     return client.sendEvent(roomID, EventType.RoomMessage, content);
+  }
+
+  private async toRoomMessageContents(
+    message: AdapterPostableMessage
+  ): Promise<MatrixRoomMessageContent[]> {
+    const textContent = this.toRoomMessageContent(message);
+    const uploads = await this.collectUploads(message);
+    const linkLines = this.collectLinkOnlyAttachmentLines(message);
+    const textBody = this.mergeTextAndLinks(textContent.body ?? "", linkLines);
+    const textMsgType = textContent.msgtype ?? MsgType.Text;
+    const contents: MatrixRoomMessageContent[] = [];
+
+    if (textBody.length > 0) {
+      contents.push({
+        ...textContent,
+        body: textBody,
+        msgtype: textMsgType,
+      });
+    }
+
+    for (const upload of uploads) {
+      const uploadResponse = await this.requireClient().uploadContent(upload.data, {
+        name: upload.fileName,
+        type: upload.info?.mimetype,
+      });
+      const mediaContent = {
+        body: upload.fileName,
+        msgtype: upload.msgtype,
+        url: uploadResponse.content_uri,
+        info: upload.info,
+      } as unknown as MatrixRoomMessageContent;
+      contents.push(mediaContent);
+    }
+
+    if (contents.length === 0) {
+      contents.push({
+        ...textContent,
+        body: "",
+        msgtype: textMsgType,
+      });
+    }
+
+    return contents;
   }
 
   private async maybeInitE2EE(): Promise<void> {
@@ -1309,6 +1363,10 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       return;
     }
 
+    if (event.getType() === EventType.RoomMember) {
+      await this.maybeAutoJoinInvite(event, roomID);
+    }
+
     if (!this.liveSyncReady) {
       this.logger.debug("Ignoring pre-live-sync event", {
         eventId: eventID,
@@ -1383,6 +1441,67 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     }
   }
 
+  private async maybeAutoJoinInvite(
+    event: MatrixEvent,
+    roomID: string
+  ): Promise<void> {
+    if (!this.inviteAutoJoinEnabled || event.getType() !== EventType.RoomMember) {
+      return;
+    }
+
+    const membership = event.getContent<{ membership?: string }>()?.membership;
+    if (membership !== "invite") {
+      return;
+    }
+
+    const targetUserID = event.getStateKey();
+    if (!targetUserID || targetUserID !== this.userID) {
+      return;
+    }
+
+    const inviter = event.getSender();
+    if (!this.shouldAcceptInvite(roomID, inviter)) {
+      this.logger.info("Declined Matrix invite due to invite auto-join policy", {
+        roomId: roomID,
+        inviter,
+      });
+      return;
+    }
+
+    try {
+      await this.requireClient().joinRoom(roomID);
+      this.logger.info("Accepted Matrix invite", {
+        roomId: roomID,
+        inviter,
+      });
+    } catch (error) {
+      this.logger.warn("Failed to auto-join Matrix invite", {
+        roomId: roomID,
+        inviter,
+        error,
+      });
+    }
+  }
+
+  private shouldAcceptInvite(
+    roomID: string,
+    inviter: string | null | undefined
+  ): boolean {
+    if (this.roomAllowlist && !this.roomAllowlist.has(roomID)) {
+      return false;
+    }
+
+    if (!this.inviteAutoJoinInviterAllowlist) {
+      return true;
+    }
+
+    if (!inviter) {
+      return false;
+    }
+
+    return this.inviteAutoJoinInviterAllowlist.has(inviter);
+  }
+
   private handleReactionEvent(event: MatrixEvent, roomID: string): void {
     const content = event.getContent<{ "m.relates_to"?: Record<string, unknown> }>();
     const relatesTo = content["m.relates_to"];
@@ -1420,6 +1539,16 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
         rawEmoji: key,
         userID: sender,
       });
+
+      if (this.reactionByEventID.size > 10_000) {
+        const toDelete = this.reactionByEventID.size - 5_000;
+        let deleted = 0;
+        for (const id of this.reactionByEventID.keys()) {
+          if (deleted >= toDelete) break;
+          this.reactionByEventID.delete(id);
+          deleted++;
+        }
+      }
     }
 
     this.requireChat().processReaction({
@@ -1586,7 +1715,185 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       }
     }
 
-    return String(message);
+    return "";
+  }
+
+  private mergeTextAndLinks(text: string, linkLines: string[]): string {
+    if (linkLines.length === 0) {
+      return text;
+    }
+
+    const suffix = linkLines.join("\n");
+    if (!text) {
+      return suffix;
+    }
+
+    return `${text}\n\n${suffix}`;
+  }
+
+  private collectLinkOnlyAttachmentLines(message: AdapterPostableMessage): string[] {
+    const attachments = this.extractAttachmentsFromMessage(message);
+    const lines: string[] = [];
+    for (const attachment of attachments) {
+      const hasLocalData =
+        Boolean(attachment.data) || typeof attachment.fetchData === "function";
+      if (hasLocalData) {
+        continue;
+      }
+      if (!attachment.url) {
+        continue;
+      }
+      const label = attachment.name ?? attachment.type;
+      lines.push(`${label}: ${attachment.url}`);
+    }
+    return lines;
+  }
+
+  private async collectUploads(
+    message: AdapterPostableMessage
+  ): Promise<OutboundUpload[]> {
+    const uploads: OutboundUpload[] = [];
+    const files = this.extractFilesFromMessage(message);
+    for (const file of files) {
+      uploads.push({
+        data: this.normalizeUploadData(file.data),
+        fileName: file.filename,
+        info: {
+          mimetype: normalizeOptionalString(file.mimeType),
+          size: this.binarySize(file.data),
+        },
+        msgtype: this.messageTypeForFile(file.mimeType),
+      });
+    }
+
+    const attachments = this.extractAttachmentsFromMessage(message);
+    for (const attachment of attachments) {
+      const data = await this.readAttachmentData(attachment);
+      if (!data) {
+        continue;
+      }
+      const fileName =
+        normalizeOptionalString(attachment.name) ??
+        this.defaultAttachmentName(attachment);
+      uploads.push({
+        data: this.normalizeUploadData(data),
+        fileName,
+        info: {
+          h: attachment.height,
+          mimetype: normalizeOptionalString(attachment.mimeType),
+          size: attachment.size ?? this.binarySize(data),
+          w: attachment.width,
+        },
+        msgtype: this.messageTypeForAttachment(attachment),
+        type: attachment.type,
+      });
+    }
+
+    return uploads;
+  }
+
+  private extractFilesFromMessage(message: AdapterPostableMessage): FileUpload[] {
+    if (typeof message !== "object" || message === null) {
+      return [];
+    }
+    if (!("files" in message) || !Array.isArray(message.files)) {
+      return [];
+    }
+    return message.files.filter((file): file is FileUpload => isRecord(file));
+  }
+
+  private extractAttachmentsFromMessage(message: AdapterPostableMessage): Attachment[] {
+    if (typeof message !== "object" || message === null) {
+      return [];
+    }
+    if (!("attachments" in message) || !Array.isArray(message.attachments)) {
+      return [];
+    }
+    return message.attachments.filter((attachment): attachment is Attachment =>
+      isRecord(attachment)
+    );
+  }
+
+  private async readAttachmentData(
+    attachment: Attachment
+  ): Promise<Buffer | Blob | ArrayBuffer | null> {
+    if (typeof attachment.fetchData === "function") {
+      return attachment.fetchData();
+    }
+    return attachment.data ?? null;
+  }
+
+  private normalizeUploadData(data: Buffer | Blob | ArrayBuffer): Blob {
+    if (data instanceof Blob) {
+      return data;
+    }
+    if (this.isNodeBuffer(data)) {
+      const start = data.byteOffset;
+      const end = data.byteOffset + data.byteLength;
+      const arrayBuffer = data.buffer.slice(start, end) as ArrayBuffer;
+      return new Blob([arrayBuffer]);
+    }
+    return new Blob([data]);
+  }
+
+  private binarySize(data: Buffer | Blob | ArrayBuffer): number {
+    if (data instanceof ArrayBuffer) {
+      return data.byteLength;
+    }
+    if (this.isNodeBuffer(data)) {
+      return data.length;
+    }
+    return data.size;
+  }
+
+  private isNodeBuffer(value: unknown): value is Buffer {
+    return typeof Buffer !== "undefined" && Buffer.isBuffer(value);
+  }
+
+  private messageTypeForFile(mimeType?: string): MatrixMediaMsgType {
+    return this.messageTypeForMimeType(normalizeOptionalString(mimeType));
+  }
+
+  private messageTypeForAttachment(attachment: Attachment): MatrixMediaMsgType {
+    switch (attachment.type) {
+      case "image":
+        return MsgType.Image;
+      case "video":
+        return MsgType.Video;
+      case "audio":
+        return MsgType.Audio;
+      default:
+        return this.messageTypeForMimeType(normalizeOptionalString(attachment.mimeType));
+    }
+  }
+
+  private messageTypeForMimeType(mimeType?: string): MatrixMediaMsgType {
+    if (!mimeType) {
+      return MsgType.File;
+    }
+    if (mimeType.startsWith("image/")) {
+      return MsgType.Image;
+    }
+    if (mimeType.startsWith("video/")) {
+      return MsgType.Video;
+    }
+    if (mimeType.startsWith("audio/")) {
+      return MsgType.Audio;
+    }
+    return MsgType.File;
+  }
+
+  private defaultAttachmentName(attachment: Attachment): string {
+    switch (attachment.type) {
+      case "image":
+        return "image";
+      case "video":
+        return "video";
+      case "audio":
+        return "audio";
+      default:
+        return "file";
+    }
   }
 
   private mustGetEventByID(roomID: string, eventID: string): MatrixEvent {
@@ -1706,18 +2013,8 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     }
 
     const encryptedPayload = this.sessionConfig.encrypt(JSON.stringify(session));
-    return {
-      authType: session.authType,
-      baseURL: session.baseURL,
-      createdAt: session.createdAt,
-      deviceID: session.deviceID,
-      e2eeEnabled: session.e2eeEnabled,
-      encryptedPayload,
-      recoveryKeyPresent: session.recoveryKeyPresent,
-      updatedAt: session.updatedAt,
-      userID: session.userID,
-      username: session.username,
-    };
+    const { accessToken, ...metadata } = session;
+    return { ...metadata, encryptedPayload };
   }
 
   private decodeStoredSession(
@@ -1837,7 +2134,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
         continue;
       }
       const value = await this.stateAdapter.get<string | null>(key);
-      const normalized = normalizeOptionalString(value ?? undefined);
+      const normalized = normalizeOptionalString(value);
       if (normalized) {
         return normalized;
       }
@@ -1920,6 +2217,13 @@ export function createMatrixAdapter(config?: MatrixAdapterConfig): MatrixAdapter
   const recoveryKey = process.env.MATRIX_RECOVERY_KEY;
   const e2eeEnabled =
     Boolean(recoveryKey) || envBool(process.env.MATRIX_E2EE_ENABLED);
+  const inviteAutoJoinInviterAllowlist = parseEnvList(
+    process.env.MATRIX_INVITE_AUTOJOIN_ALLOWLIST
+  );
+  const inviteAutoJoinEnabled = envBool(
+    process.env.MATRIX_INVITE_AUTOJOIN_ENABLED,
+    inviteAutoJoinInviterAllowlist.length > 0
+  );
 
   const auth = resolveAuthFromEnv();
 
@@ -1937,6 +2241,10 @@ export function createMatrixAdapter(config?: MatrixAdapterConfig): MatrixAdapter
     },
     commandPrefix: process.env.MATRIX_COMMAND_PREFIX,
     recoveryKey,
+    inviteAutoJoin: {
+      enabled: inviteAutoJoinEnabled,
+      inviterAllowlist: inviteAutoJoinInviterAllowlist,
+    },
     e2ee: {
       enabled: e2eeEnabled,
       useIndexedDB: envBool(
@@ -2036,6 +2344,17 @@ function parseEnvNumber(value: string | undefined): number | undefined {
   return parsed;
 }
 
+function parseEnvList(value: string | undefined): string[] {
+  if (!value) {
+    return [];
+  }
+
+  return value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+}
+
 function generateDeviceID(length = 8): string {
   const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
   const bytes = randomBytes(length);
@@ -2048,12 +2367,22 @@ function generateDeviceID(length = 8): string {
   return out;
 }
 
-function normalizeOptionalString(value: string | undefined): string | undefined {
+function normalizeOptionalString(value: string | null | undefined): string | undefined {
   if (!value) {
     return undefined;
   }
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function normalizeStringList(values: string[] | undefined): string[] {
+  if (!values || values.length === 0) {
+    return [];
+  }
+
+  return values
+    .map((value) => normalizeOptionalString(value))
+    .filter((value): value is string => Boolean(value));
 }
 
 function hasIndexedDB(): boolean {
@@ -2067,16 +2396,9 @@ function parseSDKLogLevel(
     return undefined;
   }
   const normalized = value.trim().toLowerCase();
-  if (
-    normalized === "trace" ||
-    normalized === "debug" ||
-    normalized === "info" ||
-    normalized === "warn" ||
-    normalized === "error"
-  ) {
-    return normalized;
-  }
-  return undefined;
+  return normalized in MATRIX_SDK_LOG_LEVELS
+    ? (normalized as MatrixAdapterConfig["matrixSDKLogLevel"])
+    : undefined;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

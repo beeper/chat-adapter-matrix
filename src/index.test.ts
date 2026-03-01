@@ -11,6 +11,7 @@ function makeEvent(overrides: Record<string, unknown> = {}) {
     getRoomId: () => "!room:beeper.com",
     getTs: () => 1_700_000_000_000,
     getSender: () => "@alice:beeper.com",
+    getStateKey: () => undefined,
     getType: () => EventType.RoomMessage,
     getContent: () => ({ body: "hello" }),
     getRelation: () => null,
@@ -153,9 +154,11 @@ function makeClient() {
     stopClient: vi.fn(() => undefined),
     sendMessage: vi.fn(async () => ({ event_id: "$sent" })),
     sendEvent: vi.fn(async () => ({ event_id: "$reaction" })),
+    uploadContent: vi.fn(async () => ({ content_uri: "mxc://beeper.com/uploaded" })),
     redactEvent: vi.fn(async () => ({ event_id: "$redaction" })),
     sendTyping: vi.fn(async () => ({})),
     createRoom: vi.fn(async () => ({ room_id: "!new-dm:beeper.com" })),
+    joinRoom: vi.fn(async () => ({ room_id: "!joined:beeper.com" })),
     createMessagesRequest: vi.fn(
       async (): Promise<MessagesResponseLike> => ({ chunk: [], end: undefined })
     ),
@@ -325,6 +328,74 @@ describe("MatrixAdapter", () => {
       command: "/ping",
       text: "hi",
     });
+  });
+
+  it("auto-joins invite events from allowlisted inviters", async () => {
+    const fakeClient = makeClient();
+    const adapter = new MatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: {
+        type: "accessToken",
+        accessToken: "token",
+        userID: "@bot:beeper.com",
+      },
+      inviteAutoJoin: {
+        enabled: true,
+        inviterAllowlist: ["@alice:beeper.com"],
+      },
+      createClient: () => asMatrixClient(fakeClient),
+    });
+
+    await adapter.initialize(makeChatInstance());
+    const timelineHandler = fakeClient.__handlers.get("Room.timeline");
+
+    timelineHandler?.(
+      makeEvent({
+        getType: () => EventType.RoomMember,
+        getSender: () => "@alice:beeper.com",
+        getStateKey: () => "@bot:beeper.com",
+        getContent: () => ({ membership: "invite" }),
+      }),
+      { roomId: "!invited:beeper.com" },
+      false
+    );
+    await Promise.resolve();
+
+    expect(fakeClient.joinRoom).toHaveBeenCalledWith("!invited:beeper.com");
+  });
+
+  it("does not auto-join invite events from non-allowlisted inviters", async () => {
+    const fakeClient = makeClient();
+    const adapter = new MatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: {
+        type: "accessToken",
+        accessToken: "token",
+        userID: "@bot:beeper.com",
+      },
+      inviteAutoJoin: {
+        enabled: true,
+        inviterAllowlist: ["@trusted:beeper.com"],
+      },
+      createClient: () => asMatrixClient(fakeClient),
+    });
+
+    await adapter.initialize(makeChatInstance());
+    const timelineHandler = fakeClient.__handlers.get("Room.timeline");
+
+    timelineHandler?.(
+      makeEvent({
+        getType: () => EventType.RoomMember,
+        getSender: () => "@alice:beeper.com",
+        getStateKey: () => "@bot:beeper.com",
+        getContent: () => ({ membership: "invite" }),
+      }),
+      { roomId: "!blocked:beeper.com" },
+      false
+    );
+    await Promise.resolve();
+
+    expect(fakeClient.joinRoom).not.toHaveBeenCalled();
   });
 
   it("maps reaction add and redaction remove events", async () => {
@@ -557,6 +628,104 @@ describe("MatrixAdapter", () => {
           rel_type: RelationType.Replace,
           event_id: "$original",
         },
+      })
+    );
+  });
+
+  it("uploads file payloads and posts Matrix media events", async () => {
+    const fakeClient = makeClient();
+    fakeClient.sendEvent = vi
+      .fn()
+      .mockResolvedValueOnce({ event_id: "$text" })
+      .mockResolvedValueOnce({ event_id: "$file" });
+    fakeClient.uploadContent = vi
+      .fn()
+      .mockResolvedValueOnce({ content_uri: "mxc://beeper.com/file-1" });
+
+    const adapter = new MatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: {
+        type: "accessToken",
+        accessToken: "token",
+        userID: "@bot:beeper.com",
+      },
+      createClient: () => asMatrixClient(fakeClient),
+    });
+
+    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter()) }));
+
+    await adapter.postMessage("matrix:!room%3Abeeper.com", {
+      markdown: "File incoming",
+      files: [
+        {
+          data: new Uint8Array([1, 2, 3]).buffer,
+          filename: "report.png",
+          mimeType: "image/png",
+        },
+      ],
+    });
+
+    expect(fakeClient.uploadContent).toHaveBeenCalledWith(
+      expect.any(Blob),
+      expect.objectContaining({
+        name: "report.png",
+        type: "image/png",
+      })
+    );
+    expect(fakeClient.sendEvent).toHaveBeenNthCalledWith(
+      1,
+      "!room:beeper.com",
+      EventType.RoomMessage,
+      expect.objectContaining({
+        body: "File incoming",
+        msgtype: "m.text",
+      })
+    );
+    expect(fakeClient.sendEvent).toHaveBeenNthCalledWith(
+      2,
+      "!room:beeper.com",
+      EventType.RoomMessage,
+      expect.objectContaining({
+        body: "report.png",
+        msgtype: "m.image",
+        url: "mxc://beeper.com/file-1",
+      })
+    );
+  });
+
+  it("appends URL-only attachments to message body", async () => {
+    const fakeClient = makeClient();
+    fakeClient.sendEvent = vi.fn(async () => ({ event_id: "$text" }));
+    const adapter = new MatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: {
+        type: "accessToken",
+        accessToken: "token",
+        userID: "@bot:beeper.com",
+      },
+      createClient: () => asMatrixClient(fakeClient),
+    });
+
+    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter()) }));
+
+    await adapter.postMessage("matrix:!room%3Abeeper.com", {
+      raw: "See attachment",
+      attachments: [
+        {
+          type: "file",
+          name: "spec",
+          url: "https://example.com/spec.pdf",
+        },
+      ],
+    });
+
+    expect(fakeClient.uploadContent).not.toHaveBeenCalled();
+    expect(fakeClient.sendEvent).toHaveBeenCalledWith(
+      "!room:beeper.com",
+      EventType.RoomMessage,
+      expect.objectContaining({
+        msgtype: "m.text",
+        body: "See attachment\n\nspec: https://example.com/spec.pdf",
       })
     );
   });
