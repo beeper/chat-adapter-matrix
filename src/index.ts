@@ -43,6 +43,7 @@ import sdk, {
   ThreadFilterType,
   THREAD_RELATION_TYPE,
 } from "matrix-js-sdk";
+import { MatrixError } from "matrix-js-sdk/lib/http-api/errors";
 import { decodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key";
 import type {
   RoomMessageEventContent,
@@ -98,7 +99,6 @@ type MatrixRoomMessageContent = RoomMessageEventContent & {
     "com.beeper.dont_render_edited"?: boolean;
   };
 };
-
 
 type StoredReaction = {
   emoji: EmojiValue;
@@ -638,7 +638,6 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     options: ListThreadsOptions = {}
   ): Promise<ListThreadsResult<MatrixEvent>> {
     const roomID = this.decodeThreadId(channelId).roomID;
-    const direction: CursorDirection = "backward";
     const limit = options.limit ?? 50;
     const cursor = options.cursor
       ? this.decodeCursorV1(options.cursor, "thread_list", roomID)
@@ -678,7 +677,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       nextCursor: listResponse.end
         ? this.encodeCursorV1({
             kind: "thread_list",
-            dir: direction,
+            dir: "backward",
             token: listResponse.end,
             roomID,
           })
@@ -795,7 +794,12 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       args.limit,
       this.toSDKDirection(args.direction)
     );
-    const events = await this.mapRawEvents(response.chunk ?? [], args.roomID);
+    const messageChunk = (response.chunk ?? []).filter(
+      (raw) =>
+        raw.type === EventType.RoomMessage ||
+        raw.type === EventType.RoomMessageEncrypted
+    );
+    const events = await this.mapRawEvents(messageChunk, args.roomID);
     const filtered = events.filter((event) => {
       if (event.getType() !== EventType.RoomMessage) {
         return false;
@@ -914,12 +918,14 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       await this.tryDecryptEvent(mapped);
       return mapped;
     } catch (error) {
-      this.logger.debug("Failed to fetch room event", {
-        roomID,
-        eventID,
-        error: String(error),
-      });
-      return null;
+      const isNotFound =
+        error instanceof MatrixError &&
+        (error.errcode === "M_NOT_FOUND" || error.httpStatus === 404);
+      if (isNotFound) {
+        this.logger.debug("Room event not found", { roomID, eventID });
+        return null;
+      }
+      throw error;
     }
   }
 
@@ -1047,8 +1053,10 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
         userID,
         deviceID: whoami.deviceID ?? this.deviceID,
       };
-      await this.persistDeviceIDForResolvedUser(userID);
-      await this.persistSession(resolved);
+      await Promise.all([
+        this.persistDeviceIDForResolvedUser(userID),
+        this.persistSession(resolved),
+      ]);
       return resolved;
     }
 
@@ -1061,8 +1069,10 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
           userID: whoami.userID,
           deviceID: this.deviceID ?? whoami.deviceID ?? restored.deviceID,
         };
-        await this.persistDeviceIDForResolvedUser(resolved.userID, resolved.deviceID);
-        await this.persistSession(resolved, restored.createdAt);
+        await Promise.all([
+          this.persistDeviceIDForResolvedUser(resolved.userID, resolved.deviceID),
+          this.persistSession(resolved, restored.createdAt),
+        ]);
         this.logger.info("Reused persisted Matrix session", {
           userId: resolved.userID,
         });
@@ -1103,8 +1113,10 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       userID,
       deviceID: loginResponse.device_id ?? this.deviceID ?? undefined,
     };
-    await this.persistDeviceIDForResolvedUser(resolved.userID, resolved.deviceID);
-    await this.persistSession(resolved);
+    await Promise.all([
+      this.persistDeviceIDForResolvedUser(resolved.userID, resolved.deviceID),
+      this.persistSession(resolved),
+    ]);
     return resolved;
   }
 
@@ -1745,7 +1757,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
           mimetype: normalizeOptionalString(file.mimeType),
           size: this.binarySize(file.data),
         },
-        msgtype: this.messageTypeForFile(file.mimeType),
+        msgtype: this.messageTypeForMimeType(normalizeOptionalString(file.mimeType)),
       });
     }
 
@@ -1825,10 +1837,6 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
 
   private isNodeBuffer(value: unknown): value is Buffer {
     return typeof Buffer !== "undefined" && Buffer.isBuffer(value);
-  }
-
-  private messageTypeForFile(mimeType?: string): MatrixMediaMsgType {
-    return this.messageTypeForMimeType(normalizeOptionalString(mimeType));
   }
 
   private messageTypeForAttachment(attachment: Attachment): MatrixMediaMsgType {

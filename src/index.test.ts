@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { getEmoji } from "chat";
 import type { ChatInstance, StateAdapter } from "chat";
 import { EventType, RelationType, type MatrixClient } from "matrix-js-sdk";
+import { MatrixError } from "matrix-js-sdk/lib/http-api/errors";
 import { encodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key";
 import { createMatrixAdapter, MatrixAdapter } from "./index";
 
@@ -1202,6 +1203,30 @@ describe("MatrixAdapter", () => {
       "$reply-other-thread"
     );
     expect(mismatch).toBeNull();
+  });
+
+  it("fetchMessage returns null when server returns M_NOT_FOUND", async () => {
+    const fakeClient = makeClient();
+    const adapter = await makeInitializedAdapter(fakeClient);
+    fakeClient.fetchRoomEvent.mockRejectedValueOnce(
+      new MatrixError({ errcode: "M_NOT_FOUND", error: "Event not found" }, 404)
+    );
+    const result = await adapter.fetchMessage?.(
+      "matrix:!room%3Abeeper.com:%24root",
+      "$missing"
+    );
+    expect(result).toBeNull();
+  });
+
+  it("fetchMessage propagates transient server errors", async () => {
+    const fakeClient = makeClient();
+    const adapter = await makeInitializedAdapter(fakeClient);
+    fakeClient.fetchRoomEvent.mockRejectedValueOnce(
+      new MatrixError({ errcode: "M_UNKNOWN", error: "Internal server error" }, 500)
+    );
+    await expect(
+      adapter.fetchMessage?.("matrix:!room%3Abeeper.com:%24root", "$event")
+    ).rejects.toThrow("Internal server error");
   });
 
   it("openDM reuses cached mapping, then m.direct mapping, then creates and persists", async () => {
