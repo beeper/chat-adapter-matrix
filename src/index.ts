@@ -404,7 +404,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     emoji: EmojiValue | string
   ): Promise<void> {
     const { roomID, rootEventID } = this.decodeThreadId(threadId);
-    const rawEmoji = typeof emoji === "string" ? emoji : emoji.toString();
+    const rawEmoji = this.rawEmoji(emoji);
 
     const response = await this.requireClient().sendEvent(
       roomID,
@@ -428,7 +428,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     messageId: string,
     emoji: EmojiValue | string
   ): Promise<void> {
-    const rawEmoji = typeof emoji === "string" ? emoji : emoji.toString();
+    const rawEmoji = this.rawEmoji(emoji);
     const reactionEventID = this.myReactionByKey.get(
       this.myReactionKey(threadId, messageId, rawEmoji)
     );
@@ -609,11 +609,12 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     const roomID = this.decodeChannelID(channelId);
     const room = this.requireRoom(roomID);
 
+    const members = room.getJoinedMembers();
     return {
       id: channelId,
       name: room.name,
-      isDM: room.getJoinedMembers().length === 2,
-      memberCount: room.getJoinedMembers().length,
+      isDM: members.length === 2,
+      memberCount: members.length,
       metadata: {
         roomID,
       },
@@ -822,11 +823,16 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       }
     );
 
+    const candidateEvents = relationResponse.events.filter(
+      (event) =>
+        event.getType() === EventType.RoomMessage ||
+        event.getType() === EventType.RoomMessageEncrypted
+    );
     await Promise.all(
-      relationResponse.events.map((event) => this.tryDecryptEvent(event))
+      candidateEvents.map((event) => this.tryDecryptEvent(event))
     );
     const replies = this.sortEventsChronologically(
-      relationResponse.events.filter((event) =>
+      candidateEvents.filter((event) =>
         this.isMessageEventInContext(event, args.roomID, args.rootEventID)
       )
     );
@@ -1288,7 +1294,13 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       }
       this.processedTimelineEventIDs.add(eventID);
       if (this.processedTimelineEventIDs.size > 10_000) {
-        this.processedTimelineEventIDs.clear();
+        const toDelete = this.processedTimelineEventIDs.size - 5_000;
+        let deleted = 0;
+        for (const id of this.processedTimelineEventIDs) {
+          if (deleted >= toDelete) break;
+          this.processedTimelineEventIDs.delete(id);
+          deleted++;
+        }
       }
     }
 
@@ -1320,48 +1332,24 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
 
     await this.tryDecryptEvent(event);
 
-    const chat = this.requireChat();
-
-    if (event.getType() === EventType.Reaction) {
-      this.logger.debug("Matrix timeline event received", {
-        eventId: event.getId(),
-        eventType: event.getType(),
-        roomId: roomID,
-      });
-      this.logger.debug("Processing reaction event", {
-        eventId: event.getId(),
-        roomId: roomID,
-      });
-      this.handleReactionEvent(event, roomID);
-      return;
-    }
-
-    if (event.isRedaction()) {
-      this.logger.debug("Matrix timeline event received", {
-        eventId: event.getId(),
-        eventType: event.getType(),
-        roomId: roomID,
-      });
-      this.logger.debug("Processing redaction event", {
-        eventId: event.getId(),
-        redacts: event.getAssociatedId(),
-      });
-      this.handleReactionRedaction(event);
-      return;
-    }
-
-    if (
-      event.getType() !== EventType.RoomMessage &&
-      event.getType() !== EventType.RoomMessageEncrypted
-    ) {
-      return;
-    }
     this.logger.debug("Matrix timeline event received", {
       eventId: event.getId(),
       eventType: event.getType(),
       roomId: roomID,
       sender: event.getSender(),
     });
+
+    const chat = this.requireChat();
+
+    if (event.getType() === EventType.Reaction) {
+      this.handleReactionEvent(event, roomID);
+      return;
+    }
+
+    if (event.isRedaction()) {
+      this.handleReactionRedaction(event);
+      return;
+    }
 
     if (event.getType() !== EventType.RoomMessage) {
       return;
@@ -1601,26 +1589,6 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     return String(message);
   }
 
-  private isMessageEvent(
-    event: MatrixEvent,
-    roomID: string,
-    rootEventID?: string
-  ): boolean {
-    if (event.getType() !== EventType.RoomMessage) {
-      return false;
-    }
-
-    if (event.getRoomId() !== roomID) {
-      return false;
-    }
-
-    if (!rootEventID) {
-      return !event.threadRootId;
-    }
-
-    return event.threadRootId === rootEventID || event.getId() === rootEventID;
-  }
-
   private mustGetEventByID(roomID: string, eventID: string): MatrixEvent {
     const room = this.requireRoom(roomID);
     const event = room.findEventById(eventID);
@@ -1638,6 +1606,10 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       isBot: userId === this.userID,
       isMe: userId === this.userID,
     };
+  }
+
+  private rawEmoji(emoji: EmojiValue | string): string {
+    return typeof emoji === "string" ? emoji : emoji.toString();
   }
 
   private myReactionKey(
@@ -1714,15 +1686,16 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       username: this.auth.type === "password" ? this.auth.username : undefined,
     };
     const encodedSession = this.encodeStoredSession(session);
+    const sessionKey = this.getSessionStorageKey(auth.userID);
 
     await this.stateAdapter.set(
-      this.getSessionStorageKey(auth.userID),
+      sessionKey,
       encodedSession,
       this.sessionConfig.ttlMs
     );
 
     const temporaryKey = this.getSessionUsernameTemporaryKey();
-    if (temporaryKey && temporaryKey !== this.getSessionStorageKey(auth.userID)) {
+    if (temporaryKey && temporaryKey !== sessionKey) {
       await this.stateAdapter.set(temporaryKey, encodedSession, this.sessionConfig.ttlMs);
     }
   }
