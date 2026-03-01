@@ -39,6 +39,7 @@ import sdk, {
   MsgType,
   RelationType,
   RoomEvent,
+  SyncState,
   ThreadFilterType,
   THREAD_RELATION_TYPE,
 } from "matrix-js-sdk";
@@ -69,7 +70,8 @@ const FAST_SYNC_DEFAULTS: NonNullable<MatrixAdapterConfig["sync"]> = {
   disablePresence: true,
   pollTimeout: 10_000,
 };
-const MATRIX_SDK_LOG_LEVELS: Record<string, number> = {
+type SDKLogLevel = NonNullable<MatrixAdapterConfig["matrixSDKLogLevel"]>;
+const MATRIX_SDK_LOG_LEVELS: Record<SDKLogLevel, number> = {
   trace: 0,
   debug: 1,
   info: 2,
@@ -96,6 +98,7 @@ type MatrixRoomMessageContent = RoomMessageEventContent & {
     "com.beeper.dont_render_edited"?: boolean;
   };
 };
+
 
 type StoredReaction = {
   emoji: EmojiValue;
@@ -273,7 +276,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     }
 
     this.client.on(ClientEvent.Sync, (state: string) => {
-      if (state === "PREPARED" || state === "SYNCING") {
+      if (state === SyncState.Prepared || state === SyncState.Syncing) {
         this.liveSyncReady = true;
       }
       this.logger.debug("Matrix sync state", { state });
@@ -370,9 +373,10 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     const { roomID, rootEventID } = this.decodeThreadId(threadId);
     const contents = await this.toRoomMessageContents(message);
     const [firstContent, ...extraContents] = contents;
-    const primaryContent =
-      firstContent ?? ({ body: "", msgtype: MsgType.Text } as MatrixRoomMessageContent);
-    const response = await this.sendRoomMessage(roomID, rootEventID, primaryContent);
+    if (!firstContent) {
+      throw new Error("toRoomMessageContents returned an empty array");
+    }
+    const response = await this.sendRoomMessage(roomID, rootEventID, firstContent);
     for (const content of extraContents) {
       await this.sendRoomMessage(roomID, rootEventID, content);
     }
@@ -388,7 +392,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     channelId: string,
     message: AdapterPostableMessage
   ): Promise<RawMessage<MatrixEvent>> {
-    const roomID = this.decodeChannelID(channelId);
+    const roomID = this.decodeThreadId(channelId).roomID;
     return this.postMessage(this.encodeThreadId({ roomID }), message);
   }
 
@@ -574,7 +578,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     channelId: string,
     options: FetchOptions = {}
   ): Promise<FetchResult<MatrixEvent>> {
-    const roomID = this.decodeChannelID(channelId);
+    const roomID = this.decodeThreadId(channelId).roomID;
     return this.fetchMessages(this.encodeThreadId({ roomID }), options);
   }
 
@@ -614,7 +618,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   }
 
   async fetchChannelInfo(channelId: string): Promise<ChannelInfo> {
-    const roomID = this.decodeChannelID(channelId);
+    const roomID = this.decodeThreadId(channelId).roomID;
     const room = this.requireRoom(roomID);
 
     const members = room.getJoinedMembers();
@@ -633,7 +637,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     channelId: string,
     options: ListThreadsOptions = {}
   ): Promise<ListThreadsResult<MatrixEvent>> {
-    const roomID = this.decodeChannelID(channelId);
+    const roomID = this.decodeThreadId(channelId).roomID;
     const direction: CursorDirection = "backward";
     const limit = options.limit ?? 50;
     const cursor = options.cursor
@@ -1058,7 +1062,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
           deviceID: this.deviceID ?? whoami.deviceID ?? restored.deviceID,
         };
         await this.persistDeviceIDForResolvedUser(resolved.userID, resolved.deviceID);
-        await this.persistSession(resolved);
+        await this.persistSession(resolved, restored.createdAt);
         this.logger.info("Reused persisted Matrix session", {
           userId: resolved.userID,
         });
@@ -1185,8 +1189,9 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     message: AdapterPostableMessage
   ): Promise<MatrixRoomMessageContent[]> {
     const textContent = this.toRoomMessageContent(message);
-    const uploads = await this.collectUploads(message);
-    const linkLines = this.collectLinkOnlyAttachmentLines(message);
+    const attachments = this.extractAttachmentsFromMessage(message);
+    const uploads = await this.collectUploads(message, attachments);
+    const linkLines = this.collectLinkOnlyAttachmentLines(attachments);
     const textBody = this.mergeTextAndLinks(textContent.body ?? "", linkLines);
     const textMsgType = textContent.msgtype ?? MsgType.Text;
     const contents: MatrixRoomMessageContent[] = [];
@@ -1199,19 +1204,21 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       });
     }
 
-    for (const upload of uploads) {
-      const uploadResponse = await this.requireClient().uploadContent(upload.data, {
-        name: upload.fileName,
-        type: upload.info?.mimetype,
-      });
-      const mediaContent = {
-        body: upload.fileName,
-        msgtype: upload.msgtype,
-        url: uploadResponse.content_uri,
-        info: upload.info,
-      } as unknown as MatrixRoomMessageContent;
-      contents.push(mediaContent);
-    }
+    const uploadedContents = await Promise.all(
+      uploads.map(async (upload) => {
+        const uploadResponse = await this.requireClient().uploadContent(upload.data, {
+          name: upload.fileName,
+          type: upload.info?.mimetype,
+        });
+        return {
+          body: upload.fileName,
+          msgtype: upload.msgtype,
+          url: uploadResponse.content_uri,
+          info: upload.info,
+        } as unknown as MatrixRoomMessageContent;
+      })
+    );
+    contents.push(...uploadedContents);
 
     if (contents.length === 0) {
       contents.push({
@@ -1324,14 +1331,6 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     return room;
   }
 
-  private decodeChannelID(channelId: string): string {
-    const parts = channelId.split(":");
-    if (parts.length !== 2 || parts[0] !== MATRIX_PREFIX) {
-      throw new Error(`Invalid Matrix channel ID: ${channelId}`);
-    }
-    return decodeURIComponent(parts[1]);
-  }
-
   private async onTimelineEvent(
     event: MatrixEvent,
     room: Room | undefined,
@@ -1347,15 +1346,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
         return;
       }
       this.processedTimelineEventIDs.add(eventID);
-      if (this.processedTimelineEventIDs.size > 10_000) {
-        const toDelete = this.processedTimelineEventIDs.size - 5_000;
-        let deleted = 0;
-        for (const id of this.processedTimelineEventIDs) {
-          if (deleted >= toDelete) break;
-          this.processedTimelineEventIDs.delete(id);
-          deleted++;
-        }
-      }
+      evictOldestEntries(this.processedTimelineEventIDs);
     }
 
     const roomID = room?.roomId ?? event.getRoomId();
@@ -1540,15 +1531,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
         userID: sender,
       });
 
-      if (this.reactionByEventID.size > 10_000) {
-        const toDelete = this.reactionByEventID.size - 5_000;
-        let deleted = 0;
-        for (const id of this.reactionByEventID.keys()) {
-          if (deleted >= toDelete) break;
-          this.reactionByEventID.delete(id);
-          deleted++;
-        }
-      }
+      evictOldestEntries(this.reactionByEventID);
     }
 
     this.requireChat().processReaction({
@@ -1731,8 +1714,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     return `${text}\n\n${suffix}`;
   }
 
-  private collectLinkOnlyAttachmentLines(message: AdapterPostableMessage): string[] {
-    const attachments = this.extractAttachmentsFromMessage(message);
+  private collectLinkOnlyAttachmentLines(attachments: Attachment[]): string[] {
     const lines: string[] = [];
     for (const attachment of attachments) {
       const hasLocalData =
@@ -1750,7 +1732,8 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   }
 
   private async collectUploads(
-    message: AdapterPostableMessage
+    message: AdapterPostableMessage,
+    attachments: Attachment[]
   ): Promise<OutboundUpload[]> {
     const uploads: OutboundUpload[] = [];
     const files = this.extractFilesFromMessage(message);
@@ -1766,7 +1749,6 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       });
     }
 
-    const attachments = this.extractAttachmentsFromMessage(message);
     for (const attachment of attachments) {
       const data = await this.readAttachmentData(attachment);
       if (!data) {
@@ -1809,9 +1791,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     if (!("attachments" in message) || !Array.isArray(message.attachments)) {
       return [];
     }
-    return message.attachments.filter((attachment): attachment is Attachment =>
-      isRecord(attachment)
-    );
+    return message.attachments.filter((a): a is Attachment => isRecord(a));
   }
 
   private async readAttachmentData(
@@ -1828,10 +1808,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       return data;
     }
     if (this.isNodeBuffer(data)) {
-      const start = data.byteOffset;
-      const end = data.byteOffset + data.byteLength;
-      const arrayBuffer = data.buffer.slice(start, end) as ArrayBuffer;
-      return new Blob([arrayBuffer]);
+      return new Blob([new Uint8Array(data)]);
     }
     return new Blob([data]);
   }
@@ -1973,18 +1950,17 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     return null;
   }
 
-  private async persistSession(auth: ResolvedAuth): Promise<void> {
+  private async persistSession(auth: ResolvedAuth, existingCreatedAt?: string): Promise<void> {
     if (!this.sessionConfig.enabled || !this.stateAdapter) {
       return;
     }
 
     const now = new Date().toISOString();
-    const existing = await this.loadPersistedSession();
     const session: StoredSession = {
       accessToken: auth.accessToken,
       authType: this.auth.type,
       baseURL: this.baseURL,
-      createdAt: existing?.createdAt ?? now,
+      createdAt: existingCreatedAt ?? now,
       deviceID: auth.deviceID,
       e2eeEnabled: Boolean(this.e2eeConfig?.enabled),
       recoveryKeyPresent: Boolean(this.e2eeConfig?.storagePassword),
@@ -2389,16 +2365,31 @@ function hasIndexedDB(): boolean {
   return typeof globalThis.indexedDB !== "undefined" && globalThis.indexedDB !== null;
 }
 
-function parseSDKLogLevel(
-  value: string | undefined
-): MatrixAdapterConfig["matrixSDKLogLevel"] | undefined {
+function isSDKLogLevel(value: string): value is SDKLogLevel {
+  return value in MATRIX_SDK_LOG_LEVELS;
+}
+
+function parseSDKLogLevel(value: string | undefined): SDKLogLevel | undefined {
   if (!value) {
     return undefined;
   }
   const normalized = value.trim().toLowerCase();
-  return normalized in MATRIX_SDK_LOG_LEVELS
-    ? (normalized as MatrixAdapterConfig["matrixSDKLogLevel"])
-    : undefined;
+  return isSDKLogLevel(normalized) ? normalized : undefined;
+}
+
+function evictOldestEntries(
+  collection: { size: number; keys(): Iterable<string>; delete(key: string): unknown },
+  maxSize = 10_000,
+  targetSize = 5_000
+): void {
+  if (collection.size <= maxSize) return;
+  const toDelete = collection.size - targetSize;
+  let deleted = 0;
+  for (const key of collection.keys()) {
+    if (deleted >= toDelete) break;
+    collection.delete(key);
+    deleted++;
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

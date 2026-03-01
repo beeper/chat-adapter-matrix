@@ -267,6 +267,16 @@ function makeChatInstance(overrides: Record<string, unknown> = {}): ChatInstance
   } as unknown as ChatInstance;
 }
 
+async function makeInitializedAdapter(fakeClient: ReturnType<typeof makeClient>) {
+  const adapter = new MatrixAdapter({
+    baseURL: "https://hs.beeper.com",
+    auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
+    createClient: () => asMatrixClient(fakeClient),
+  });
+  await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter()) }));
+  return adapter;
+}
+
 describe("MatrixAdapter", () => {
   it("encodes and decodes thread IDs", () => {
     const adapter = new MatrixAdapter({
@@ -596,17 +606,7 @@ describe("MatrixAdapter", () => {
 
   it("sends Matrix edit payload with dont_render_edited context", async () => {
     const fakeClient = makeClient();
-    const adapter = new MatrixAdapter({
-      baseURL: "https://hs.beeper.com",
-      auth: {
-        type: "accessToken",
-        accessToken: "token",
-        userID: "@bot:beeper.com",
-      },
-      createClient: () => asMatrixClient(fakeClient),
-    });
-
-    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter()) }));
+    const adapter = await makeInitializedAdapter(fakeClient);
 
     await adapter.editMessage(
       "matrix:!room%3Abeeper.com",
@@ -642,17 +642,7 @@ describe("MatrixAdapter", () => {
       .fn()
       .mockResolvedValueOnce({ content_uri: "mxc://beeper.com/file-1" });
 
-    const adapter = new MatrixAdapter({
-      baseURL: "https://hs.beeper.com",
-      auth: {
-        type: "accessToken",
-        accessToken: "token",
-        userID: "@bot:beeper.com",
-      },
-      createClient: () => asMatrixClient(fakeClient),
-    });
-
-    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter()) }));
+    const adapter = await makeInitializedAdapter(fakeClient);
 
     await adapter.postMessage("matrix:!room%3Abeeper.com", {
       markdown: "File incoming",
@@ -696,17 +686,7 @@ describe("MatrixAdapter", () => {
   it("appends URL-only attachments to message body", async () => {
     const fakeClient = makeClient();
     fakeClient.sendEvent = vi.fn(async () => ({ event_id: "$text" }));
-    const adapter = new MatrixAdapter({
-      baseURL: "https://hs.beeper.com",
-      auth: {
-        type: "accessToken",
-        accessToken: "token",
-        userID: "@bot:beeper.com",
-      },
-      createClient: () => asMatrixClient(fakeClient),
-    });
-
-    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter()) }));
+    const adapter = await makeInitializedAdapter(fakeClient);
 
     await adapter.postMessage("matrix:!room%3Abeeper.com", {
       raw: "See attachment",
@@ -790,17 +770,7 @@ describe("MatrixAdapter", () => {
 
   it("shuts down matrix client cleanly", async () => {
     const fakeClient = makeClient();
-    const adapter = new MatrixAdapter({
-      baseURL: "https://hs.beeper.com",
-      auth: {
-        type: "accessToken",
-        accessToken: "token",
-        userID: "@bot:beeper.com",
-      },
-      createClient: () => asMatrixClient(fakeClient),
-    });
-
-    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter()) }));
+    const adapter = await makeInitializedAdapter(fakeClient);
 
     await adapter.shutdown();
     expect(fakeClient.stopClient).toHaveBeenCalledOnce();
@@ -1024,12 +994,7 @@ describe("MatrixAdapter", () => {
 
   it("rejects legacy cursors for API pagination", async () => {
     const fakeClient = makeClient();
-    const adapter = new MatrixAdapter({
-      baseURL: "https://hs.beeper.com",
-      auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
-      createClient: () => asMatrixClient(fakeClient),
-    });
-    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter()) }));
+    const adapter = await makeInitializedAdapter(fakeClient);
 
     await expect(
       adapter.fetchMessages("matrix:!room%3Abeeper.com", { cursor: "$legacy_cursor" })
@@ -1067,12 +1032,7 @@ describe("MatrixAdapter", () => {
         end: undefined,
       });
 
-    const adapter = new MatrixAdapter({
-      baseURL: "https://hs.beeper.com",
-      auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
-      createClient: () => asMatrixClient(fakeClient),
-    });
-    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter()) }));
+    const adapter = await makeInitializedAdapter(fakeClient);
 
     const firstPage = await adapter.fetchMessages("matrix:!room%3Abeeper.com", {
       direction: "backward",
@@ -1147,12 +1107,7 @@ describe("MatrixAdapter", () => {
       })
     );
 
-    const adapter = new MatrixAdapter({
-      baseURL: "https://hs.beeper.com",
-      auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
-      createClient: () => asMatrixClient(fakeClient),
-    });
-    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter()) }));
+    const adapter = await makeInitializedAdapter(fakeClient);
 
     const page = await adapter.fetchMessages(
       "matrix:!room%3Abeeper.com:%24root",
@@ -1200,12 +1155,7 @@ describe("MatrixAdapter", () => {
       end: "channel-page-token-1",
     });
 
-    const adapter = new MatrixAdapter({
-      baseURL: "https://hs.beeper.com",
-      auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
-      createClient: () => asMatrixClient(fakeClient),
-    });
-    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter()) }));
+    const adapter = await makeInitializedAdapter(fakeClient);
 
     const result = await adapter.fetchChannelMessages?.("matrix:!room%3Abeeper.com", {
       direction: "backward",
@@ -1224,12 +1174,7 @@ describe("MatrixAdapter", () => {
 
   it("fetches a single message in context and returns null for mismatches", async () => {
     const fakeClient = makeClient();
-    const adapter = new MatrixAdapter({
-      baseURL: "https://hs.beeper.com",
-      auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
-      createClient: () => asMatrixClient(fakeClient),
-    });
-    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter()) }));
+    const adapter = await makeInitializedAdapter(fakeClient);
 
     fakeClient.fetchRoomEvent
       .mockResolvedValueOnce(
@@ -1350,12 +1295,7 @@ describe("MatrixAdapter", () => {
       end: "thread-list-page-token-1",
     });
 
-    const adapter = new MatrixAdapter({
-      baseURL: "https://hs.beeper.com",
-      auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
-      createClient: () => asMatrixClient(fakeClient),
-    });
-    await adapter.initialize(makeChatInstance({ getState: vi.fn(() => makeStateAdapter()) }));
+    const adapter = await makeInitializedAdapter(fakeClient);
 
     const result = await adapter.listThreads("matrix:!room%3Abeeper.com", { limit: 2 });
 
