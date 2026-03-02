@@ -1,6 +1,6 @@
 {
   "name": "@beeper/chat-adapter-matrix",
-  "version": "1.0.0",
+  "version": "0.2.0",
   "description": "Matrix adapter for chat",
   "type": "module",
   "main": "./dist/index.js",
@@ -23,14 +23,15 @@
     "token:bun": "bun run scripts/get-access-token.ts",
     "clean:repo": "rm -rf dist coverage",
     "test": "vitest run --coverage",
+    "test:e2e": "vitest run --config vitest.config.e2e.ts",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist"
   },
   "dependencies": {
-    "@chat-adapter/state-memory": "^4.13.4",
-    "@chat-adapter/state-redis": "^4.13.4",
-    "chat": "^4.13.4",
+    "@chat-adapter/state-memory": "^4.15.0",
+    "@chat-adapter/state-redis": "^4.15.0",
+    "chat": "^4.15.0",
     "matrix-js-sdk": "^41.0.0"
   },
   "devDependencies": {

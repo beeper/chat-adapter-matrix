@@ -313,6 +313,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
 
     this.shuttingDown = true;
     try {
+      this.client.removeAllListeners();
       this.client.stopClient();
       this.reactionByEventID.clear();
       this.myReactionByKey.clear();
@@ -2053,8 +2054,13 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       return null;
     }
 
-    const privateKey = decodeRecoveryKey(this.recoveryKey);
-    return [keyID, privateKey];
+    try {
+      const privateKey = decodeRecoveryKey(this.recoveryKey);
+      return [keyID, privateKey];
+    } catch {
+      this.logger.warn("Invalid recovery key format, unable to decode");
+      return null;
+    }
   }
 
   private validateConfig(config: MatrixAdapterConfig): void {

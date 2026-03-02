@@ -153,6 +153,7 @@ function makeClient() {
     },
     startClient: vi.fn(async () => undefined),
     stopClient: vi.fn(() => undefined),
+    removeAllListeners: vi.fn(() => undefined),
     sendMessage: vi.fn(async () => ({ event_id: "$sent" })),
     sendEvent: vi.fn(async () => ({ event_id: "$reaction" })),
     uploadContent: vi.fn(async () => ({ content_uri: "mxc://beeper.com/uploaded" })),
