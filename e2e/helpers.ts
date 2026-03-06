@@ -1,27 +1,22 @@
 import { randomBytes } from "node:crypto";
-import { Chat, type Message } from "chat";
+import { Chat, type Message, type ReactionEvent, type StateAdapter } from "chat";
 import { createMemoryState } from "@chat-adapter/state-memory";
-import type { MatrixClient, MatrixEvent } from "matrix-js-sdk";
+import { EventType } from "matrix-js-sdk";
+import type { MatrixClient, MatrixEvent, Room } from "matrix-js-sdk";
 import { MatrixAdapter } from "../src/index";
 
 export const env = {
   get baseURL(): string {
     return process.env.E2E_BASE_URL!;
   },
-  get botAccessToken(): string {
-    return process.env.E2E_BOT_ACCESS_TOKEN!;
-  },
-  get botUserID(): string {
-    return process.env.E2E_BOT_USER_ID!;
+  get botLoginToken(): string {
+    return process.env.E2E_BOT_LOGIN_TOKEN!;
   },
   get botRecoveryKey(): string | undefined {
     return process.env.E2E_BOT_RECOVERY_KEY || undefined;
   },
-  get senderAccessToken(): string {
-    return process.env.E2E_SENDER_ACCESS_TOKEN!;
-  },
-  get senderUserID(): string {
-    return process.env.E2E_SENDER_USER_ID!;
+  get senderLoginToken(): string {
+    return process.env.E2E_SENDER_LOGIN_TOKEN!;
   },
   get senderRecoveryKey(): string | undefined {
     return process.env.E2E_SENDER_RECOVERY_KEY || undefined;
@@ -31,83 +26,150 @@ export const env = {
   },
 };
 
-export function generateDeviceID(): string {
-  return `E2E_${randomBytes(8).toString("hex").toUpperCase()}`;
-}
-
 export interface E2EParticipant {
   adapter: MatrixAdapter;
   chat: Chat;
   matrixClient: MatrixClient;
+  session: MatrixLoginResponse;
+  state: StateAdapter;
+  userID: string;
   onMessage: (cb: ((threadID: string, message: Message<MatrixEvent>) => void) | null) => void;
-  onReaction: (cb: ((data: {
-    threadId: string;
-    messageId: string;
-    emoji: unknown;
-    rawEmoji: string;
-    added: boolean;
-    user: unknown;
-  }) => void) | null) => void;
+  onReaction: (cb: ((data: ReactionEvent<MatrixEvent>) => void) | null) => void;
 }
 
 export async function createParticipant(opts: {
+  loginToken: string;
   name: string;
-  accessToken: string;
-  userID: string;
   recoveryKey?: string;
 }): Promise<E2EParticipant> {
+  const login = await loginToMatrix(opts.loginToken, opts.name);
+  return createParticipantFromSession({
+    name: opts.name,
+    recoveryKey: opts.recoveryKey,
+    session: login,
+  });
+}
+
+export async function createParticipantFromSession(opts: {
+  name: string;
+  recoveryKey?: string;
+  session: MatrixLoginResponse;
+  state?: StateAdapter;
+}): Promise<E2EParticipant> {
+  const state = opts.state ?? createMemoryState();
   const adapter = new MatrixAdapter({
     baseURL: env.baseURL,
     auth: {
       type: "accessToken",
-      accessToken: opts.accessToken,
-      userID: opts.userID,
+      accessToken: opts.session.accessToken,
+      userID: opts.session.userID,
     },
-    deviceID: generateDeviceID(),
+    deviceID: opts.session.deviceID,
     inviteAutoJoin: { enabled: true },
-    e2ee: { enabled: true },
+    e2ee: {
+      enabled: true,
+      useIndexedDB: false,
+    },
     recoveryKey: opts.recoveryKey,
   });
 
   let messageCallback: ((threadID: string, message: Message<MatrixEvent>) => void) | null = null;
-  let reactionCallback: ((data: {
-    threadId: string;
-    messageId: string;
-    emoji: unknown;
-    rawEmoji: string;
-    added: boolean;
-    user: unknown;
-  }) => void) | null = null;
+  let reactionCallback: ((data: ReactionEvent<MatrixEvent>) => void) | null = null;
 
   const chat = new Chat({
     userName: opts.name,
-    state: createMemoryState(),
+    state,
     adapters: { matrix: adapter },
   });
 
-  chat.onNewMessage(async (_thread, message, { threadId }) => {
-    messageCallback?.(threadId, message);
+  chat.onNewMessage(/[\s\S]*/u, async (thread, message, context) => {
+    messageCallback?.(context?.threadId ?? thread.id, message);
   });
 
-  chat.onSubscribedMessage(async (_thread, message, { threadId }) => {
-    messageCallback?.(threadId, message);
+  chat.onSubscribedMessage(async (thread, message, context) => {
+    messageCallback?.(context?.threadId ?? thread.id, message);
   });
 
-  chat.onReaction(async (event) => {
-    reactionCallback?.(event as any);
+  chat.onReaction(async (event: ReactionEvent<MatrixEvent>) => {
+    reactionCallback?.(event);
   });
 
   await chat.initialize();
 
-  const matrixClient = (adapter as any).client as MatrixClient;
+  const matrixClient = getInitializedClient(adapter);
 
   return {
     adapter,
     chat,
     matrixClient,
+    session: opts.session,
+    state,
+    userID: opts.session.userID,
     onMessage: (cb) => { messageCallback = cb; },
     onReaction: (cb) => { reactionCallback = cb; },
   };
+}
+
+export async function shutdownParticipant(participant: E2EParticipant): Promise<void> {
+  participant.onMessage(null);
+  participant.onReaction(null);
+  await participant.adapter.shutdown();
+}
+
+type MatrixLoginResponse = {
+  accessToken: string;
+  deviceID: string;
+  userID: string;
+};
+
+function generateDeviceID(): string {
+  return `E2E_${randomBytes(8).toString("hex").toUpperCase()}`;
+}
+
+async function loginToMatrix(
+  loginToken: string,
+  participantName: string
+): Promise<MatrixLoginResponse> {
+  const requestedDeviceID = generateDeviceID();
+  const response = await fetch(`${env.baseURL}/_matrix/client/v3/login`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      type: "org.matrix.login.jwt",
+      token: loginToken,
+      device_id: requestedDeviceID,
+      initial_device_display_name: `matrix-chat-adapter-${participantName}`,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      `Matrix login failed with ${response.status}: ${await response.text()}`
+    );
+  }
+
+  const payload = (await response.json()) as {
+    access_token?: unknown;
+    device_id?: unknown;
+    user_id?: unknown;
+  };
+  const accessToken = readStringProperty(payload.access_token, "access_token");
+  const userID = readStringProperty(payload.user_id, "user_id");
+  const deviceID =
+    typeof payload.device_id === "string" && payload.device_id.length > 0
+      ? payload.device_id
+      : requestedDeviceID;
+
+  return { accessToken, deviceID, userID };
+}
+
+function readStringProperty(value: unknown, key: string): string {
+  if (typeof value === "string" && value.length > 0) {
+    return value;
+  }
+  throw new Error(`Matrix login response is missing ${key}`);
 }
 
 export async function getOrCreateRoom(
@@ -119,7 +181,15 @@ export async function getOrCreateRoom(
   }
 
   const { room_id } = await botClient.createRoom({
+    preset: "private_chat",
     invite: [senderUserID],
+    initial_state: [
+      {
+        type: EventType.RoomEncryption,
+        state_key: "",
+        content: { algorithm: "m.megolm.v1.aes-sha2" },
+      },
+    ],
   });
 
   // sender auto-joins via inviteAutoJoin; give sync time to propagate
@@ -133,16 +203,162 @@ export function waitForEvent<T>(
   timeoutMs = 10_000
 ): Promise<T> {
   return new Promise<T>((resolve, reject) => {
+    let cleanup: (() => void) | void;
+    let settled = false;
+    let shouldCleanupAfterSubscribe = false;
+
+    const settle = (finish: () => void) => {
+      if (settled) {
+        return;
+      }
+
+      settled = true;
+      clearTimeout(timer);
+      if (cleanup) {
+        cleanup();
+      } else {
+        shouldCleanupAfterSubscribe = true;
+      }
+      finish();
+    };
+
     const timer = setTimeout(() => {
-      cleanup?.();
-      reject(new Error(`waitForEvent timed out after ${timeoutMs}ms`));
+      settle(() => reject(new Error(`waitForEvent timed out after ${timeoutMs}ms`)));
     }, timeoutMs);
 
-    const cleanup = subscribe((value) => {
-      clearTimeout(timer);
-      resolve(value);
-    });
+    try {
+      cleanup = subscribe((value) => {
+        settle(() => resolve(value));
+      });
+      if (shouldCleanupAfterSubscribe) {
+        cleanup?.();
+      }
+    } catch (error) {
+      settle(() => reject(error));
+    }
   });
+}
+
+export async function waitForCondition(
+  condition: () => boolean,
+  timeoutMs = 10_000,
+  intervalMs = 250
+): Promise<void> {
+  const startedAt = Date.now();
+
+  while (true) {
+    if (condition()) {
+      return;
+    }
+
+    if (Date.now() - startedAt >= timeoutMs) {
+      throw new Error(`waitForCondition timed out after ${timeoutMs}ms`);
+    }
+
+    await sleep(intervalMs);
+  }
+}
+
+export async function waitForRoom(
+  client: MatrixClient,
+  roomID: string,
+  timeoutMs = 10_000
+): Promise<Room> {
+  await waitForCondition(() => Boolean(client.getRoom(roomID)), timeoutMs);
+  const room = client.getRoom(roomID);
+  if (!room) {
+    throw new Error(`Room ${roomID} was not found after waiting`);
+  }
+  return room;
+}
+
+export async function waitForEncryptedRoom(
+  client: MatrixClient,
+  roomID: string,
+  timeoutMs = 20_000
+): Promise<Room> {
+  const room = await waitForRoom(client, roomID, timeoutMs);
+  await waitForCondition(() => client.isRoomEncrypted(roomID), timeoutMs);
+  return room;
+}
+
+export async function waitForJoinedMemberCount(
+  client: MatrixClient,
+  roomID: string,
+  expectedCount: number,
+  timeoutMs = 20_000
+): Promise<Room> {
+  const room = await waitForRoom(client, roomID, timeoutMs);
+  await waitForCondition(
+    () => (client.getRoom(roomID)?.getJoinedMembers().length ?? 0) >= expectedCount,
+    timeoutMs
+  );
+  return room;
+}
+
+export async function waitForFetchedMessage(
+  adapter: MatrixAdapter,
+  threadId: string,
+  messageId: string,
+  predicate: (message: Message<MatrixEvent>) => boolean = () => true,
+  timeoutMs = 30_000,
+  intervalMs = 1_000
+): Promise<Message<MatrixEvent>> {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const message = await adapter.fetchMessage(threadId, messageId);
+    if (message && isDecryptedMessage(message) && predicate(message)) {
+      return message;
+    }
+    await sleep(intervalMs);
+  }
+
+  throw new Error(`waitForFetchedMessage timed out after ${timeoutMs}ms`);
+}
+
+export async function waitForMatchingMessage(
+  adapter: MatrixAdapter,
+  threadId: string,
+  predicate: (message: Message<MatrixEvent>) => boolean,
+  timeoutMs = 30_000,
+  intervalMs = 1_000,
+  limit = 20
+): Promise<Message<MatrixEvent>> {
+  const startedAt = Date.now();
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const page = await adapter.fetchMessages(threadId, {
+      direction: "backward",
+      limit,
+    });
+    const match = page.messages.find(
+      (message) => isDecryptedMessage(message) && predicate(message)
+    );
+    if (match) {
+      return match;
+    }
+    await sleep(intervalMs);
+  }
+
+  throw new Error(`waitForMatchingMessage timed out after ${timeoutMs}ms`);
+}
+
+function getInitializedClient(adapter: MatrixAdapter): MatrixClient {
+  const candidate: unknown = Reflect.get(adapter, "client");
+  if (!isMatrixClient(candidate)) {
+    throw new Error("Matrix client was not initialized");
+  }
+  return candidate;
+}
+
+function isMatrixClient(value: unknown): value is MatrixClient {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typeof Reflect.get(value, "startClient") === "function" &&
+    typeof Reflect.get(value, "stopClient") === "function"
+  );
 }
 
 export function sleep(ms: number): Promise<void> {
@@ -151,4 +367,8 @@ export function sleep(ms: number): Promise<void> {
 
 export function nonce(): string {
   return Math.random().toString(36).slice(2, 10);
+}
+
+function isDecryptedMessage(message: Message<MatrixEvent>): boolean {
+  return !message.text.startsWith("** Unable to decrypt:");
 }
