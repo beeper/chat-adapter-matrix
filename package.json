@@ -33,7 +33,9 @@
     "@chat-adapter/state-memory": "^4.16.1",
     "@chat-adapter/state-redis": "^4.16.1",
     "chat": "^4.16.1",
-    "matrix-js-sdk": "^41.0.0"
+    "marked": "^15.0.12",
+    "matrix-js-sdk": "^41.0.0",
+    "node-html-parser": "^7.1.0"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

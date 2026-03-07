@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import type { Message } from "chat";
+import { stringifyMarkdown, type Message } from "chat";
 import { EventType, RoomEvent, RoomMemberEvent, type MatrixEvent } from "matrix-js-sdk";
 import {
   createParticipant,
@@ -117,6 +117,27 @@ describe.skipIf(!hasCredentials)("E2E Matrix Adapter", () => {
     );
     expect(message.text).toContain(tag);
     expect(message.author.userId).toBe(bot.userID);
+  });
+
+  it("preserves rich text and mention semantics across encrypted delivery", async () => {
+    const tag = `e2e-format-${nonce()}`;
+    const localpart = bot.userID.slice(1).split(":")[0];
+    const threadId = sender.adapter.encodeThreadId({ roomID });
+    const posted = await sender.adapter.postMessage(threadId, {
+      markdown: `Hello **${tag}** <@${bot.userID}>`,
+    });
+    const message = await waitForFetchedMessage(
+      bot.adapter,
+      bot.adapter.encodeThreadId({ roomID }),
+      posted.id,
+      (candidate) => candidate.text.includes(tag) && candidate.isMention === true,
+      45_000
+    );
+
+    expect(message.text).toContain(`Hello ${tag} @${localpart}`);
+    expect(message.isMention).toBe(true);
+    expect(stringifyMarkdown(message.formatted).trim()).toContain(`**${tag}**`);
+    expect(stringifyMarkdown(message.formatted)).toContain(`@${localpart}`);
   });
 
   it("thread round-trip: sender creates thread, bot replies in it", async () => {
@@ -275,7 +296,9 @@ describe.skipIf(!hasCredentials)("E2E Matrix Adapter", () => {
     );
 
     // Bot edits the message
-    await bot.adapter.editMessage(threadId, messageId, `Edited ${editedTag}`);
+    await bot.adapter.editMessage(threadId, messageId, {
+      markdown: `Edited **${editedTag}**`,
+    });
     const editedMessage = await waitForMatchingMessage(
       sender.adapter,
       sender.adapter.encodeThreadId({ roomID }),
@@ -288,6 +311,9 @@ describe.skipIf(!hasCredentials)("E2E Matrix Adapter", () => {
 
     expect(editedMessage.text).toContain(editedTag);
     expect(editedMessage.text).not.toContain(tag);
+    expect(stringifyMarkdown(editedMessage.formatted).trim()).toContain(
+      `**${editedTag}**`
+    );
 
     const fetched = await waitForFetchedMessage(
       sender.adapter,
@@ -300,6 +326,46 @@ describe.skipIf(!hasCredentials)("E2E Matrix Adapter", () => {
     );
     expect(fetched.text).toContain(editedTag);
     expect(fetched.text).not.toContain(tag);
+    expect(stringifyMarkdown(fetched.formatted).trim()).toContain(`**${editedTag}**`);
+  });
+
+  it("strips Matrix reply fallback from fetched reply messages", async () => {
+    const rootTag = `e2e-reply-root-${nonce()}`;
+    const replyTag = `e2e-reply-visible-${nonce()}`;
+    const threadId = sender.adapter.encodeThreadId({ roomID });
+    const rootPosted = await sender.adapter.postMessage(threadId, `Reply root ${rootTag}`);
+    await waitForFetchedMessage(
+      bot.adapter,
+      bot.adapter.encodeThreadId({ roomID }),
+      rootPosted.id,
+      (message) => message.text.includes(rootTag)
+    );
+
+    const replyResponse = await sender.matrixClient.sendEvent(roomID, EventType.RoomMessage, {
+      msgtype: "m.text",
+      body: `> <${bot.userID}> Reply root ${rootTag}\n> quoted\n\nVisible ${replyTag}`,
+      format: "org.matrix.custom.html",
+      formatted_body:
+        `<mx-reply><blockquote><a href="https://matrix.to/#/${encodeURIComponent(roomID)}/${encodeURIComponent(rootPosted.id)}">In reply to</a>` +
+        ` <a href="https://matrix.to/#/${encodeURIComponent(bot.userID)}">${bot.userID}</a><br>Reply root ${rootTag}</blockquote></mx-reply>` +
+        `<p>Visible ${replyTag}</p>`,
+      "m.relates_to": {
+        "m.in_reply_to": {
+          event_id: rootPosted.id,
+        },
+      },
+    });
+
+    const replyMessage = await waitForFetchedMessage(
+      bot.adapter,
+      bot.adapter.encodeThreadId({ roomID }),
+      replyResponse.event_id,
+      (message) => message.text.includes(replyTag),
+      45_000
+    );
+
+    expect(replyMessage.text).toBe(`Visible ${replyTag}`);
+    expect(stringifyMarkdown(replyMessage.formatted).trim()).toBe(`Visible ${replyTag}`);
   });
 
   it("fetchMessages pagination", async () => {
@@ -556,6 +622,39 @@ describe.skipIf(!hasCredentials)("E2E Matrix Adapter", () => {
     expect(summary?.rootMessage.id).toBe(rootPosted.id);
     expect(summary?.rootMessage.text).toContain(rootTag);
     expect((summary?.replyCount ?? 0) >= 1).toBe(true);
+  });
+
+  it("includes live room metadata in channel and thread info", async () => {
+    const topic = `Adapter metadata ${nonce()}`;
+    await bot.matrixClient.sendStateEvent(
+      roomID,
+      EventType.RoomTopic,
+      { topic },
+      ""
+    );
+    await sleep(1_000);
+
+    const channelId = bot.adapter.channelIdFromThreadId(bot.adapter.encodeThreadId({ roomID }));
+    const rootPosted = await bot.adapter.postMessage(
+      bot.adapter.encodeThreadId({ roomID }),
+      `Metadata root ${nonce()}`
+    );
+    const threadId = bot.adapter.encodeThreadId({
+      roomID,
+      rootEventID: rootPosted.id,
+    });
+
+    const [channelInfo, threadInfo] = await Promise.all([
+      bot.adapter.fetchChannelInfo(channelId),
+      bot.adapter.fetchThread(threadId),
+    ]);
+
+    expect(channelInfo.metadata?.roomID).toBe(roomID);
+    expect(channelInfo.metadata?.topic).toBe(topic);
+    expect(channelInfo.metadata?.encrypted).toBe(true);
+    expect(threadInfo.metadata?.roomID).toBe(roomID);
+    expect(threadInfo.metadata?.topic).toBe(topic);
+    expect(threadInfo.metadata?.encrypted).toBe(true);
   });
 
   it("uploads a file attachment and fetches it back", async () => {

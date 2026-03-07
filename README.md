@@ -137,6 +137,9 @@ bun --env-file=examples/.env run examples/bot.ts
 - `fetchMessage(threadId, messageId)` fetches a single message with thread/channel context validation.
 - `fetchChannelMessages(channelId, options)` fetches top-level room timeline messages.
 - `fetchMessages(threadId, options)` and `listThreads(channelId, options)` use API-first server pagination via `matrix-js-sdk`.
+- Inbound Matrix rich text is normalized from `formatted_body` when present, including reply fallback stripping and Matrix pill mention parsing.
+- Outbound markdown and Chat SDK mention placeholders are rendered to Matrix `formatted_body` with `org.matrix.custom.html` and `m.mentions`.
+- `fetchThread()` and `fetchChannelInfo()` expose room metadata such as `roomID`, DM status, topic, canonical alias, avatar MXC URL, and encryption details when that state is available locally.
 - Outbound file support: `files` and binary `attachments` are uploaded with `uploadContent()` and sent as Matrix media messages.
 - URL-only attachments are appended as links in the text body.
 - `postEphemeral`, `openModal`, and native `stream` are not implemented by this adapter.
@@ -146,6 +149,8 @@ bun --env-file=examples/.env run examples/bot.ts
 - `handleWebhook()` returns `501` by design, since this adapter is sync-based.
 - Access-token auth resolves identity with `whoami`.
 - Password auth sends the configured `device_id` during login.
+- Mention sending uses Chat SDK's standard `<@userId>` placeholder syntax and is translated into Matrix pills at send time.
+- Matrix reply linkage remains in the raw event/metadata path; the adapter strips the visible quoted fallback from normalized message text.
 - For production, use Redis state for stable sessions and device IDs.
 
 For release-specific changes and migration notes, see [CHANGELOG.md](./CHANGELOG.md).

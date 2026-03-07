@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { Chat, getEmoji } from "chat";
+import { Chat, getEmoji, stringifyMarkdown } from "chat";
 import type { ChatInstance, Logger, StateAdapter } from "chat";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { EventType, MsgType, RelationType, type MatrixClient } from "matrix-js-sdk";
@@ -32,10 +32,26 @@ type RelationsResponseLike = {
   prevBatch: string | null;
 };
 
+type MemberLike = {
+  name?: string;
+  rawDisplayName?: string;
+};
+
+type StateEventLike = {
+  getContent: <T>() => T;
+};
+
+type RoomStateLike = {
+  getStateEvents: (eventType: string, stateKey: string) => StateEventLike | null;
+};
+
 type RoomLike = {
+  currentState: RoomStateLike;
+  getMember: (userId: string) => MemberLike | null;
   roomId: string;
   name: string;
   timeline: unknown[];
+  hasEncryptionStateEvent: () => boolean;
   getJoinedMembers: () => Array<Record<string, never>>;
   getMyMembership: () => string;
   findEventById: (eventID?: string) => ReturnType<typeof makeEvent> | null;
@@ -73,6 +89,12 @@ function makeEvent(overrides: Record<string, unknown> = {}) {
   };
 
   return event;
+}
+
+function makeStateEvent(content: Record<string, unknown>): StateEventLike {
+  return {
+    getContent: <T>() => content as T,
+  };
 }
 
 function makeRawEvent(overrides: Record<string, unknown> = {}) {
@@ -235,11 +257,29 @@ function makeRoom(overrides: Partial<RoomLike> = {}): RoomLike {
     roomId: "!room:beeper.com",
     name: "Example Room",
     timeline: [],
+    currentState: {
+      getStateEvents: () => null,
+    },
+    getMember: () => null,
+    hasEncryptionStateEvent: () => false,
     getJoinedMembers: () => [{}, {}],
     getMyMembership: () => "join",
     findEventById: () => makeEvent({ getId: () => "$sent" }),
     ...overrides,
   };
+}
+
+function makeRoomState(events: Record<string, Record<string, unknown>>): RoomStateLike {
+  return {
+    getStateEvents: (eventType: string, stateKey: string) =>
+      stateKey === "" && events[eventType] ? makeStateEvent(events[eventType]) : null,
+  };
+}
+
+function makeRoomMembers(
+  members: Record<string, MemberLike>
+): RoomLike["getMember"] {
+  return (userId: string) => members[userId] ?? null;
 }
 
 function makeStateAdapter(initial: Record<string, unknown> = {}): StateAdapter {
@@ -646,21 +686,18 @@ describe("MatrixAdapter", () => {
 
   it("routes reactions to thread context when target event belongs to a thread", async () => {
     const fakeClient = makeClient();
-    fakeClient.getRoom.mockReturnValue({
-      roomId: "!room:beeper.com",
-      name: "Example Room",
-      timeline: [],
-      getJoinedMembers: () => [{}, {}],
-      getMyMembership: () => "join",
-      findEventById: (eventId?: string) =>
-        eventId === "$target"
-          ? makeEvent({
-              getId: () => "$target",
-              getRoomId: () => "!room:beeper.com",
-              threadRootId: "$root",
-            })
-          : null,
-    });
+    fakeClient.getRoom.mockReturnValue(
+      makeRoom({
+        findEventById: (eventId?: string) =>
+          eventId === "$target"
+            ? makeEvent({
+                getId: () => "$target",
+                getRoomId: () => "!room:beeper.com",
+                threadRootId: "$root",
+              })
+            : null,
+      })
+    );
 
     const processReaction = vi.fn();
     const adapter = new MatrixAdapter({
@@ -807,6 +844,193 @@ describe("MatrixAdapter", () => {
         },
       })
     );
+  });
+
+  it("parses Matrix formatted_body, strips reply fallback, and maps author metadata", async () => {
+    const fakeClient = makeClient();
+    fakeClient.getRoom = vi.fn(() =>
+      makeRoom({
+        name: "Product Sync",
+        getMember: makeRoomMembers({
+          "@alice:beeper.com": {
+            name: "Alice Example",
+            rawDisplayName: "Alice Example",
+          },
+        }),
+      })
+    );
+    fakeClient.fetchRoomEvent = vi.fn(async () =>
+      makeRawEvent({
+        event_id: "$formatted",
+        sender: "@alice:beeper.com",
+        content: {
+          body: "> <@alice:beeper.com> replied\n> quoted\n\nHello @bot there",
+          msgtype: MsgType.Text,
+          format: "org.matrix.custom.html",
+          formatted_body:
+            '<mx-reply><blockquote>quoted</blockquote></mx-reply><p>Hello <a href="https://matrix.to/#/%40bot%3Abeeper.com">@bot</a> <strong>there</strong></p>',
+          "m.mentions": {
+            user_ids: ["@bot:beeper.com"],
+          },
+        },
+      })
+    );
+
+    const adapter = await makeInitializedAdapter(fakeClient);
+    const message = await adapter.fetchMessage(
+      "matrix:!room%3Abeeper.com",
+      "$formatted"
+    );
+
+    expect(message).toBeTruthy();
+    expect(message?.text).toBe("Hello @bot there");
+    expect(
+      stringifyMarkdown(requireValue(message, "formatted message").formatted).trim()
+    ).toBe(
+      "Hello @bot **there**"
+    );
+    expect(message?.isMention).toBe(true);
+    expect(message?.author).toMatchObject({
+      userId: "@alice:beeper.com",
+      userName: "alice",
+      fullName: "Alice Example",
+      isBot: "unknown",
+      isMe: false,
+    });
+  });
+
+  it("strips Matrix reply fallback from plain body text", async () => {
+    const fakeClient = makeClient();
+    fakeClient.fetchRoomEvent = vi.fn(async () =>
+      makeRawEvent({
+        event_id: "$reply-body",
+        content: {
+          body: "> <@alice:beeper.com> replied\n> quoted line\n\nVisible reply body",
+          msgtype: MsgType.Text,
+        },
+      })
+    );
+
+    const adapter = await makeInitializedAdapter(fakeClient);
+    const message = await adapter.fetchMessage(
+      "matrix:!room%3Abeeper.com",
+      "$reply-body"
+    );
+
+    expect(message?.text).toBe("Visible reply body");
+    expect(
+      stringifyMarkdown(requireValue(message, "reply body message").formatted).trim()
+    ).toBe(
+      "Visible reply body"
+    );
+  });
+
+  it("surfaces editedAt from aggregated replacement metadata", async () => {
+    const fakeClient = makeClient();
+    const editedAt = 1_700_000_123_000;
+    fakeClient.createMessagesRequest = vi.fn(async () => ({
+      chunk: [
+        makeRawEvent({
+          event_id: "$edited",
+          content: {
+            body: "Original body",
+            msgtype: MsgType.Text,
+          },
+          unsigned: {
+            "m.relations": {
+              "m.replace": {
+                content: {
+                  "m.new_content": {
+                    body: "Edited body",
+                    msgtype: MsgType.Text,
+                  },
+                },
+                origin_server_ts: editedAt,
+              },
+            },
+          },
+        }),
+      ],
+    }));
+
+    const adapter = await makeInitializedAdapter(fakeClient);
+    const result = await adapter.fetchMessages("matrix:!room%3Abeeper.com");
+
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0]?.text).toBe("Edited body");
+    expect(result.messages[0]?.metadata.edited).toBe(true);
+    expect(result.messages[0]?.metadata.editedAt).toEqual(new Date(editedAt));
+  });
+
+  it("renders outbound markdown and mention placeholders as Matrix rich text", async () => {
+    const fakeClient = makeClient();
+    const adapter = await makeInitializedAdapter(fakeClient);
+
+    await adapter.postMessage("matrix:!room%3Abeeper.com", {
+      markdown: "Hello **team** <@@alice:beeper.com>",
+    });
+
+    expect(fakeClient.sendEvent).toHaveBeenCalledWith(
+      "!room:beeper.com",
+      EventType.RoomMessage,
+      expect.objectContaining({
+        body: "Hello team @alice",
+        msgtype: MsgType.Text,
+        format: "org.matrix.custom.html",
+        formatted_body: expect.stringContaining("<strong>team</strong>"),
+        "m.mentions": {
+          user_ids: ["@alice:beeper.com"],
+        },
+      })
+    );
+    expect(fakeClient.sendEvent).toHaveBeenCalledWith(
+      "!room:beeper.com",
+      EventType.RoomMessage,
+      expect.objectContaining({
+        formatted_body: expect.stringContaining(
+          "https://matrix.to/#/%40alice%3Abeeper.com"
+        ),
+      })
+    );
+  });
+
+  it("enriches thread and channel metadata from Matrix room state", async () => {
+    const fakeClient = makeClient();
+    fakeClient.getRoom = vi.fn(() =>
+      makeRoom({
+        name: "Adapter QA",
+        currentState: makeRoomState({
+          "m.room.avatar": { url: "mxc://beeper.com/avatar" },
+          "m.room.canonical_alias": { alias: "#adapter:beeper.com" },
+          "m.room.encryption": { algorithm: "m.megolm.v1.aes-sha2" },
+          "m.room.topic": { topic: "Adapter verification" },
+        }),
+        hasEncryptionStateEvent: () => true,
+      })
+    );
+
+    const adapter = await makeInitializedAdapter(fakeClient);
+    const thread = await adapter.fetchThread(
+      adapter.encodeThreadId({
+        roomID: "!room:beeper.com",
+        rootEventID: "$root",
+      })
+    );
+    const channel = await adapter.fetchChannelInfo("matrix:!room%3Abeeper.com");
+
+    expect(thread.channelName).toBe("Adapter QA");
+    expect(thread.metadata).toMatchObject({
+      roomID: "!room:beeper.com",
+      canonicalAlias: "#adapter:beeper.com",
+      topic: "Adapter verification",
+      avatarURL: "mxc://beeper.com/avatar",
+      encrypted: true,
+      encryptionAlgorithm: "m.megolm.v1.aes-sha2",
+      isDM: false,
+      name: "Adapter QA",
+    });
+    expect(channel.name).toBe("Adapter QA");
+    expect(channel.metadata).toMatchObject(thread.metadata ?? {});
   });
 
   it("uploads file payloads and posts Matrix media events", async () => {

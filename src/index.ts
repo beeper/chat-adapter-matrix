@@ -24,6 +24,7 @@ import {
   getEmoji,
   isCardElement,
   Message,
+  markdownToPlainText,
   parseMarkdown,
   stringifyMarkdown,
 } from "chat";
@@ -34,6 +35,7 @@ import sdk, {
   type IEvent,
   type IThreadBundledRelationship,
   type Room,
+  type RoomMember,
   ClientEvent,
   EventType,
   MsgType,
@@ -43,14 +45,21 @@ import sdk, {
   ThreadFilterType,
   THREAD_RELATION_TYPE,
 } from "matrix-js-sdk";
-import { MatrixError } from "matrix-js-sdk/lib/http-api/errors";
-import { decodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key";
 import type {
   RoomMessageEventContent,
   RoomMessageTextEventContent,
 } from "matrix-js-sdk/lib/@types/events";
 import type { MediaEventContent } from "matrix-js-sdk/lib/@types/media";
+import { MatrixError } from "matrix-js-sdk/lib/http-api/errors";
+import { decodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key";
 import { logger as matrixSDKLogger } from "matrix-js-sdk/lib/logger";
+import { marked } from "marked";
+import {
+  HTMLElement,
+  NodeType,
+  parse as parseHTML,
+  type Node as HTMLNode,
+} from "node-html-parser";
 import type {
   MatrixAuthBootstrapClient,
   MatrixAccessTokenAuthConfig,
@@ -87,6 +96,10 @@ type MatrixMessageContent = {
   format?: string;
   formatted_body?: string;
   msgtype?: string;
+  "m.mentions"?: {
+    room?: boolean;
+    user_ids?: string[];
+  };
   [key: string]: unknown;
 };
 
@@ -169,6 +182,33 @@ type MatrixMediaMsgType =
   | MsgType.File
   | MsgType.Image
   | MsgType.Video;
+
+type ParsedMatrixContent = {
+  markdown: string;
+  mentionsRoom: boolean;
+  mentionedUserIDs: Set<string>;
+  text: string;
+};
+
+type RenderedMatrixMessage = {
+  body: string;
+  formattedBody?: string;
+  mentions?: {
+    room?: boolean;
+    user_ids?: string[];
+  };
+};
+
+type MatrixRoomMetadata = {
+  avatarURL?: string;
+  canonicalAlias?: string;
+  encrypted: boolean;
+  encryptionAlgorithm?: string;
+  isDM: boolean;
+  name?: string;
+  roomID: string;
+  topic?: string;
+};
 
 // Intentionally unsupported in this adapter: postEphemeral, openModal, and native stream.
 export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
@@ -645,31 +685,31 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   async fetchThread(threadId: string): Promise<ThreadInfo> {
     const { roomID } = this.decodeThreadId(threadId);
     const room = this.requireRoom(roomID);
+    const isDM = await this.isDirectRoom(roomID);
+    const metadata = this.readRoomMetadata(room, isDM);
 
     return {
       id: threadId,
       channelId: this.channelIdFromThreadId(threadId),
-      channelName: room.name,
-      isDM: await this.isDirectRoom(roomID),
-      metadata: {
-        roomID,
-      },
+      channelName: metadata.name,
+      isDM,
+      metadata,
     };
   }
 
   async fetchChannelInfo(channelId: string): Promise<ChannelInfo> {
     const roomID = this.decodeThreadId(channelId).roomID;
     const room = this.requireRoom(roomID);
+    const isDM = await this.isDirectRoom(roomID);
+    const metadata = this.readRoomMetadata(room, isDM);
 
     const members = room.getJoinedMembers();
     return {
       id: channelId,
-      name: room.name,
-      isDM: await this.isDirectRoom(roomID),
+      name: metadata.name,
+      isDM,
       memberCount: members.length,
-      metadata: {
-        roomID,
-      },
+      metadata,
     };
   }
 
@@ -736,24 +776,25 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
 
     const threadID = overrideThreadID ?? this.threadIDForEvent(raw, roomID);
     const content = raw.getContent<MatrixMessageContent>();
-    const editedContent = this.extractEditedContent(raw);
-    const effectiveContent = editedContent ?? content;
-    const text = this.extractText(effectiveContent);
+    const edited = this.extractEditedContent(raw);
+    const effectiveContent = edited?.content ?? content;
+    const parsed = this.parseMatrixContent(effectiveContent);
     const sender = raw.getSender() ?? "unknown";
 
     return new Message<MatrixEvent>({
       id: raw.getId() ?? `${roomID}:${raw.getTs()}`,
       threadId: threadID,
-      text,
-      formatted: parseMarkdown(text),
-      author: this.makeUser(sender),
+      text: parsed.text,
+      formatted: parseMarkdown(parsed.markdown),
+      author: this.makeUser(sender, roomID),
       metadata: {
         dateSent: new Date(raw.getTs()),
-        edited: this.isEdited(raw) || Boolean(editedContent),
+        edited: this.isEdited(raw) || Boolean(edited?.content),
+        editedAt: edited?.editedAt,
       },
       attachments: this.extractAttachments(effectiveContent),
       raw,
-      isMention: this.isMentioned(effectiveContent, text),
+      isMention: this.isMentioned(effectiveContent, parsed),
     });
   }
 
@@ -1343,16 +1384,11 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     const attachments = this.extractAttachmentsFromMessage(message);
     const uploads = await this.collectUploads(message, attachments);
     const linkLines = this.collectLinkOnlyAttachmentLines(attachments);
-    const textBody = this.mergeTextAndLinks(textContent.body ?? "", linkLines);
-    const textMsgType = textContent.msgtype ?? MsgType.Text;
+    const textBody = this.mergeTextAndLinks(textContent, linkLines);
     const contents: MatrixOutboundMessageContent[] = [];
 
-    if (textBody.length > 0) {
-      contents.push({
-        ...textContent,
-        body: textBody,
-        msgtype: textMsgType,
-      });
+    if ((normalizeOptionalString(textBody.body) ?? "").length > 0) {
+      contents.push(textBody);
     }
 
     const uploadedContents = await Promise.all(
@@ -1800,14 +1836,321 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     return this.encodeThreadId({ roomID, rootEventID });
   }
 
-  private extractText(content: MatrixMessageContent): string {
-    if (typeof content.body === "string") {
-      return content.body;
+  private readRoomMetadata(room: Room, isDM: boolean): MatrixRoomMetadata {
+    const canonicalAlias = normalizeOptionalString(
+      this.readStateEventString(room, "m.room.canonical_alias", "alias")
+    );
+    const topic = normalizeOptionalString(
+      this.readStateEventString(room, "m.room.topic", "topic")
+    );
+    const avatarURL = normalizeOptionalString(
+      this.readStateEventString(room, "m.room.avatar", "url")
+    );
+    const encryption = this.readStateEventContent(room, "m.room.encryption");
+    const encryptionAlgorithm = readStringValue(encryption?.algorithm);
+    const encrypted = this.roomHasEncryptionStateEvent(room) ?? Boolean(encryptionAlgorithm);
+
+    return {
+      roomID: room.roomId,
+      name: normalizeOptionalString(room.name) ?? canonicalAlias,
+      canonicalAlias,
+      topic,
+      avatarURL,
+      encrypted,
+      encryptionAlgorithm,
+      isDM,
+    };
+  }
+
+  private readStateEventContent(
+    room: Room,
+    eventType: string
+  ): Record<string, unknown> | undefined {
+    const event = this.readRoomStateEvent(room, eventType);
+    if (!event) {
+      return undefined;
     }
-    if (typeof content.formatted_body === "string") {
-      return content.formatted_body;
+    const content = event.getContent<Record<string, unknown>>();
+    return isRecord(content) ? content : undefined;
+  }
+
+  private readStateEventString(
+    room: Room,
+    eventType: string,
+    key: string
+  ): string | undefined {
+    const content = this.readStateEventContent(room, eventType);
+    return readStringValue(content?.[key]);
+  }
+
+  private readRoomStateEvent(room: Room, eventType: string): MatrixEvent | undefined {
+    if (!("currentState" in room) || !room.currentState) {
+      return undefined;
     }
-    return "";
+
+    const { currentState } = room;
+    if (
+      typeof currentState !== "object" ||
+      !("getStateEvents" in currentState) ||
+      typeof currentState.getStateEvents !== "function"
+    ) {
+      return undefined;
+    }
+
+    return currentState.getStateEvents(eventType, "") ?? undefined;
+  }
+
+  private roomHasEncryptionStateEvent(room: Room): boolean | undefined {
+    if (
+      !("hasEncryptionStateEvent" in room) ||
+      typeof room.hasEncryptionStateEvent !== "function"
+    ) {
+      return undefined;
+    }
+
+    return room.hasEncryptionStateEvent();
+  }
+
+  private readRoomMember(room: Room | undefined, userId: string): RoomMember | undefined {
+    if (!room || !("getMember" in room) || typeof room.getMember !== "function") {
+      return undefined;
+    }
+
+    return room.getMember(userId) ?? undefined;
+  }
+
+  private parseMatrixContent(content: MatrixMessageContent): ParsedMatrixContent {
+    const mentionedUserIDs = this.extractMentionedUserIDs(content);
+    const mentionsRoom = this.extractRoomMention(content);
+    const formattedBody = normalizeOptionalString(content.formatted_body);
+    if (formattedBody) {
+      const htmlMarkdown = this.parseMatrixHTML(formattedBody);
+      for (const mentionedUserID of htmlMarkdown.mentionedUserIDs) {
+        mentionedUserIDs.add(mentionedUserID);
+      }
+
+      if (htmlMarkdown.markdown.length > 0) {
+        return {
+          text: markdownToPlainText(htmlMarkdown.markdown),
+          markdown: htmlMarkdown.markdown,
+          mentionedUserIDs,
+          mentionsRoom,
+        };
+      }
+    }
+
+    const body = this.stripReplyFallbackFromBody(
+      normalizeOptionalString(content.body) ?? ""
+    );
+    return {
+      text: body,
+      markdown: this.markdownForPlainText(body, content.msgtype),
+      mentionedUserIDs,
+      mentionsRoom,
+    };
+  }
+
+  private parseMatrixHTML(
+    html: string
+  ): { markdown: string; mentionedUserIDs: Set<string> } {
+    const root = parseHTML(this.stripReplyFallbackFromHTML(html));
+    const mentionedUserIDs = new Set<string>();
+    const markdown = this.normalizeMarkdownSpacing(
+      this.renderHTMLNodesToMarkdown(root.childNodes, mentionedUserIDs)
+    );
+    return {
+      markdown,
+      mentionedUserIDs,
+    };
+  }
+
+  private renderHTMLNodesToMarkdown(
+    nodes: HTMLNode[],
+    mentionedUserIDs: Set<string>
+  ): string {
+    return nodes
+      .map((node) => this.renderHTMLNodeToMarkdown(node, mentionedUserIDs))
+      .join("");
+  }
+
+  private renderHTMLNodeToMarkdown(
+    node: HTMLNode,
+    mentionedUserIDs: Set<string>
+  ): string {
+    if (node.nodeType === NodeType.TEXT_NODE) {
+      return node.text;
+    }
+
+    if (!(node instanceof HTMLElement)) {
+      return "";
+    }
+
+    const tagName = node.tagName.toLowerCase();
+    const children = this.renderHTMLNodesToMarkdown(node.childNodes, mentionedUserIDs);
+
+    switch (tagName) {
+      case "mx-reply":
+        return "";
+      case "html":
+      case "body":
+      case "span":
+        return children;
+      case "br":
+        return "\n";
+      case "p":
+      case "div":
+        return children.trim() ? `${children.trim()}\n\n` : "";
+      case "strong":
+      case "b":
+        return children ? `**${children}**` : "";
+      case "em":
+      case "i":
+        return children ? `*${children}*` : "";
+      case "del":
+      case "s":
+        return children ? `~~${children}~~` : "";
+      case "code":
+        return node.parentNode instanceof HTMLElement &&
+          node.parentNode.tagName.toLowerCase() === "pre"
+          ? children
+          : `\`${children}\``;
+      case "pre": {
+        const codeContent = children.replace(/\n+$/u, "");
+        return codeContent ? `\n\`\`\`\n${codeContent}\n\`\`\`\n\n` : "";
+      }
+      case "blockquote": {
+        const quoted = children.trim();
+        if (!quoted) {
+          return "";
+        }
+        return `${quoted
+          .split("\n")
+          .map((line) => `> ${line}`)
+          .join("\n")}\n\n`;
+      }
+      case "ul":
+        return `${node.childNodes
+          .map((child) => this.renderListItemToMarkdown(child, mentionedUserIDs, null))
+          .filter(Boolean)
+          .join("\n")}\n\n`;
+      case "ol":
+        return `${node.childNodes
+          .map((child, index) =>
+            this.renderListItemToMarkdown(child, mentionedUserIDs, index + 1)
+          )
+          .filter(Boolean)
+          .join("\n")}\n\n`;
+      case "a":
+        return this.renderHTMLLinkToMarkdown(node, children, mentionedUserIDs);
+      case "img":
+        return normalizeOptionalString(node.getAttribute("alt")) ?? "image";
+      default:
+        return children;
+    }
+  }
+
+  private renderListItemToMarkdown(
+    node: HTMLNode,
+    mentionedUserIDs: Set<string>,
+    ordinal: number | null
+  ): string {
+    if (!(node instanceof HTMLElement) || node.tagName.toLowerCase() !== "li") {
+      return "";
+    }
+    const content = this.normalizeMarkdownSpacing(
+      this.renderHTMLNodesToMarkdown(node.childNodes, mentionedUserIDs)
+    );
+    if (!content) {
+      return "";
+    }
+    return `${ordinal === null ? "-" : `${ordinal}.`} ${content}`;
+  }
+
+  private renderHTMLLinkToMarkdown(
+    node: HTMLElement,
+    children: string,
+    mentionedUserIDs: Set<string>
+  ): string {
+    const href = normalizeOptionalString(node.getAttribute("href"));
+    const text = children || node.text;
+    if (!href) {
+      return text;
+    }
+
+    const mentionedUserID = this.parseMatrixToUserID(href);
+    if (mentionedUserID) {
+      mentionedUserIDs.add(mentionedUserID);
+      return text || this.matrixMentionDisplayText(mentionedUserID);
+    }
+
+    return `[${text || href}](${href})`;
+  }
+
+  private parseMatrixToUserID(href: string): string | null {
+    let url: URL;
+    try {
+      url = new URL(href);
+    } catch {
+      return null;
+    }
+
+    if (url.hostname !== "matrix.to") {
+      return null;
+    }
+
+    const rawPath = url.hash.startsWith("#/") ? url.hash.slice(2) : url.hash;
+    const firstSegment = rawPath.split("/")[0];
+    if (!firstSegment) {
+      return null;
+    }
+
+    const identifier = decodeURIComponent(firstSegment);
+    return identifier.startsWith("@") ? identifier : null;
+  }
+
+  private extractMentionedUserIDs(content: MatrixMessageContent): Set<string> {
+    const mentions = new Set<string>();
+    const matrixMentions = content["m.mentions"];
+    if (!isRecord(matrixMentions) || !Array.isArray(matrixMentions.user_ids)) {
+      return mentions;
+    }
+
+    for (const userID of matrixMentions.user_ids) {
+      if (typeof userID === "string" && userID.length > 0) {
+        mentions.add(userID);
+      }
+    }
+
+    return mentions;
+  }
+
+  private extractRoomMention(content: MatrixMessageContent): boolean {
+    const matrixMentions = content["m.mentions"];
+    return isRecord(matrixMentions) && matrixMentions.room === true;
+  }
+
+  private stripReplyFallbackFromBody(body: string): string {
+    const lines = body.split("\n");
+    let index = 0;
+    while (index < lines.length && lines[index]?.startsWith(">")) {
+      index += 1;
+    }
+
+    if (index === 0 || index >= lines.length || lines[index] !== "") {
+      return body;
+    }
+
+    return lines.slice(index + 1).join("\n");
+  }
+
+  private stripReplyFallbackFromHTML(html: string): string {
+    const root = parseHTML(html);
+    for (const child of [...root.childNodes]) {
+      if (child instanceof HTMLElement && child.tagName.toLowerCase() === "mx-reply") {
+        child.remove();
+      }
+    }
+    return root.toString();
   }
 
   private extractAttachments(content: MatrixMessageContent) {
@@ -1832,9 +2175,13 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     return [attachment];
   }
 
-  private extractEditedContent(raw: MatrixEvent): MatrixMessageContent | undefined {
+  private extractEditedContent(raw: MatrixEvent): {
+    content?: MatrixMessageContent;
+    editedAt?: Date;
+  } | undefined {
     const replacement = raw.getServerAggregatedRelation<{
       content?: MatrixRoomMessageContent;
+      origin_server_ts?: number;
     }>(RelationType.Replace);
     const replacementContent = isRecord(replacement?.content)
       ? replacement.content
@@ -1843,7 +2190,17 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       ? replacementContent["m.new_content"]
       : undefined;
 
-    return newContent;
+    if (!newContent) {
+      return undefined;
+    }
+
+    return {
+      content: newContent,
+      editedAt:
+        typeof replacement?.origin_server_ts === "number"
+          ? new Date(replacement.origin_server_ts)
+          : undefined,
+    };
   }
 
   private attachmentTypeForContent(
@@ -1945,12 +2302,19 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     return relation?.rel_type === RelationType.Replace;
   }
 
-  private isMentioned(content: MatrixMessageContent, text: string): boolean {
+  private isMentioned(content: MatrixMessageContent, parsed: ParsedMatrixContent): boolean {
+    if (parsed.mentionsRoom) {
+      return true;
+    }
+    if (this.userID && parsed.mentionedUserIDs.has(this.userID)) {
+      return true;
+    }
+
     const formatted =
       typeof content.formatted_body === "string" ? content.formatted_body : "";
 
     const hasUserID = this.userID
-      ? text.includes(this.userID) || formatted.includes(this.userID)
+      ? parsed.text.includes(this.userID) || formatted.includes(this.userID)
       : false;
     const hasMatrixTo = this.userID
       ? formatted.includes(`matrix.to/#/${encodeURIComponent(this.userID)}`)
@@ -1961,7 +2325,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       : `@${this.userName}`;
 
     const hasUserName =
-      text.includes(usernameMention) || formatted.includes(usernameMention);
+      parsed.text.includes(usernameMention) || formatted.includes(usernameMention);
 
     return hasUserID || hasMatrixTo || hasUserName;
   }
@@ -1990,52 +2354,193 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   private toRoomMessageContent(
     message: AdapterPostableMessage
   ): MatrixTextMessageContent {
-    const body = this.toText(message);
-
-    return {
-      body,
+    const rendered = this.renderTextMessage(message);
+    const content: MatrixTextMessageContent = {
+      body: rendered.body,
       msgtype: MsgType.Text,
     };
+    if (rendered.formattedBody) {
+      content.format = "org.matrix.custom.html";
+      content.formatted_body = rendered.formattedBody;
+    }
+    if (rendered.mentions) {
+      content["m.mentions"] = rendered.mentions;
+    }
+
+    return content;
   }
 
-  private toText(message: AdapterPostableMessage): string {
+  private renderTextMessage(message: AdapterPostableMessage): RenderedMatrixMessage {
     if (typeof message === "string") {
-      return message;
+      return this.renderPlainTextMessage(message);
     }
 
     if (isCardElement(message)) {
-      return "[Card message]";
+      return this.renderPlainTextMessage("[Card message]");
     }
 
     if (typeof message === "object" && message !== null) {
       if ("raw" in message && typeof message.raw === "string") {
-        return message.raw;
+        return this.renderPlainTextMessage(message.raw);
       }
       if ("markdown" in message && typeof message.markdown === "string") {
-        return message.markdown;
+        return this.renderMarkdownMessage(message.markdown);
       }
       if ("ast" in message) {
-        return stringifyMarkdown(message.ast);
+        return this.renderMarkdownMessage(stringifyMarkdown(message.ast));
       }
       if ("card" in message) {
-        return message.fallbackText ?? "[Card message]";
+        return this.renderPlainTextMessage(message.fallbackText ?? "[Card message]");
       }
     }
 
-    return "";
+    return { body: "" };
   }
 
-  private mergeTextAndLinks(text: string, linkLines: string[]): string {
+  private renderPlainTextMessage(text: string): RenderedMatrixMessage {
+    const rendered = this.replaceMentionPlaceholdersInPlainText(text);
+    if (rendered.mentionedUserIDs.size === 0) {
+      return {
+        body: rendered.body,
+      };
+    }
+
+    return {
+      body: rendered.body,
+      formattedBody: this.renderMarkdownToMatrixHTML(rendered.markdown),
+      mentions: this.buildMentionsContent(rendered.mentionedUserIDs),
+    };
+  }
+
+  private renderMarkdownMessage(markdown: string): RenderedMatrixMessage {
+    const rendered = this.replaceMentionPlaceholdersInMarkdown(markdown);
+    return {
+      body: markdownToPlainText(rendered.markdown),
+      formattedBody: this.renderMarkdownToMatrixHTML(rendered.markdown),
+      mentions: this.buildMentionsContent(rendered.mentionedUserIDs),
+    };
+  }
+
+  private replaceMentionPlaceholdersInPlainText(text: string): {
+    body: string;
+    markdown: string;
+    mentionedUserIDs: Set<string>;
+  } {
+    const mentionedUserIDs = new Set<string>();
+    const pattern = /<@(@[^>\s]+:[^>\s]+)>/gu;
+    let body = "";
+    let markdown = "";
+    let lastIndex = 0;
+
+    for (const match of text.matchAll(pattern)) {
+      const [token, userID] = match;
+      const index = match.index ?? 0;
+      const plainSegment = text.slice(lastIndex, index);
+      body += plainSegment;
+      markdown += escapeMarkdownText(plainSegment);
+
+      const mentionText = this.matrixMentionDisplayText(userID);
+      body += mentionText;
+      markdown += `[${escapeMarkdownLinkText(mentionText)}](${this.matrixToUserLink(userID)})`;
+      mentionedUserIDs.add(userID);
+      lastIndex = index + token.length;
+    }
+
+    const trailing = text.slice(lastIndex);
+    body += trailing;
+    markdown += escapeMarkdownText(trailing);
+
+    return { body, markdown, mentionedUserIDs };
+  }
+
+  private replaceMentionPlaceholdersInMarkdown(markdown: string): {
+    markdown: string;
+    mentionedUserIDs: Set<string>;
+  } {
+    const mentionedUserIDs = new Set<string>();
+    const transformed = markdown.replace(
+      /<@(@[^>\s]+:[^>\s]+)>/gu,
+      (_match, userID: string) => {
+        mentionedUserIDs.add(userID);
+        return `[${escapeMarkdownLinkText(this.matrixMentionDisplayText(userID))}](${this.matrixToUserLink(
+          userID
+        )})`;
+      }
+    );
+
+    return {
+      markdown: transformed,
+      mentionedUserIDs,
+    };
+  }
+
+  private renderMarkdownToMatrixHTML(markdown: string): string {
+    return marked.parse(markdown, {
+      async: false,
+      breaks: true,
+      gfm: true,
+    });
+  }
+
+  private buildMentionsContent(
+    mentionedUserIDs: Set<string>
+  ): { room?: boolean; user_ids?: string[] } | undefined {
+    if (mentionedUserIDs.size === 0) {
+      return undefined;
+    }
+
+    return {
+      user_ids: [...mentionedUserIDs],
+    };
+  }
+
+  private matrixToUserLink(userID: string): string {
+    return `https://matrix.to/#/${encodeURIComponent(userID)}`;
+  }
+
+  private matrixMentionDisplayText(userID: string): string {
+    return `@${matrixLocalpart(userID)}`;
+  }
+
+  private markdownForPlainText(text: string, msgtype?: string): string {
+    const escaped = escapeMarkdownText(text);
+    if (msgtype === "m.emote" && escaped.length > 0) {
+      return `*${escaped}*`;
+    }
+    return escaped;
+  }
+
+  private normalizeMarkdownSpacing(markdown: string): string {
+    return markdown.replace(/\n{3,}/gu, "\n\n").trim();
+  }
+
+  private mergeTextAndLinks(
+    content: MatrixTextMessageContent,
+    linkLines: string[]
+  ): MatrixTextMessageContent {
     if (linkLines.length === 0) {
-      return text;
+      return content;
     }
 
     const suffix = linkLines.join("\n");
-    if (!text) {
-      return suffix;
+    const body = content.body ?? "";
+    const mergedBody = body ? `${body}\n\n${suffix}` : suffix;
+    if (!content.formatted_body) {
+      return {
+        ...content,
+        body: mergedBody,
+      };
     }
 
-    return `${text}\n\n${suffix}`;
+    const formattedSuffix = linkLines
+      .map((line) => `<p>${escapeHTML(line)}</p>`)
+      .join("");
+
+    return {
+      ...content,
+      body: mergedBody,
+      formatted_body: `${content.formatted_body}${formattedSuffix}`,
+    };
   }
 
   private collectLinkOnlyAttachmentLines(attachments: Attachment[]): string[] {
@@ -2202,12 +2707,21 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     return event;
   }
 
-  private makeUser(userId: string) {
+  private makeUser(userId: string, roomId?: string) {
+    const room = roomId ? this.client?.getRoom(roomId) ?? undefined : undefined;
+    const member = this.readRoomMember(room, userId);
+    const localpart = matrixLocalpart(userId);
+    const displayName =
+      readStringValue(member?.rawDisplayName) ??
+      readStringValue(member?.name) ??
+      localpart;
+    const isBot: boolean | "unknown" = userId === this.userID ? true : "unknown";
+
     return {
       userId,
-      userName: userId,
-      fullName: userId,
-      isBot: userId === this.userID,
+      userName: localpart,
+      fullName: displayName,
+      isBot,
       isMe: userId === this.userID,
     };
   }
@@ -2366,7 +2880,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     }
 
     try {
-      const privateKey = decodeRecoveryKey(this.recoveryKey);
+      const privateKey = decodeRecoveryKey(this.recoveryKey) as Uint8Array<ArrayBuffer>;
       return [keyID, privateKey];
     } catch {
       this.logger.warn("Invalid recovery key format, unable to decode");
@@ -2674,6 +3188,31 @@ function normalizeOptionalString(value: string | null | undefined): string | und
   }
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function readStringValue(value: unknown): string | undefined {
+  return typeof value === "string" ? normalizeOptionalString(value) : undefined;
+}
+
+function matrixLocalpart(userID: string): string {
+  return userID.startsWith("@") ? userID.slice(1).split(":")[0] ?? userID : userID;
+}
+
+function escapeMarkdownText(value: string): string {
+  return value.replace(/([\\`*_{}\[\]()#+\-.!|>])/gu, "\\$1");
+}
+
+function escapeMarkdownLinkText(value: string): string {
+  return value.replace(/([\\\]])/gu, "\\$1");
+}
+
+function escapeHTML(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
 }
 
 function normalizeStringList(values: string[] | undefined): string[] {
