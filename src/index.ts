@@ -30,8 +30,8 @@ import {
 } from "chat";
 import sdk, {
   Direction,
+  MatrixEvent,
   type MatrixClient,
-  type MatrixEvent,
   type IEvent,
   type IThreadBundledRelationship,
   type Room,
@@ -428,7 +428,11 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     return {
       id: response.event_id,
       threadId,
-      raw: this.mustGetEventByID(roomID, response.event_id),
+      raw: this.resolveSentEvent(roomID, response.event_id, {
+        content: firstContent,
+        roomID,
+        sender: this.userID,
+      }),
     };
   }
 
@@ -468,7 +472,11 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     return {
       id: response.event_id,
       threadId,
-      raw: this.mustGetEventByID(roomID, response.event_id),
+      raw: this.resolveSentEvent(roomID, response.event_id, {
+        content: editContent,
+        roomID,
+        sender: this.userID,
+      }),
     };
   }
 
@@ -557,7 +565,10 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   async openDM(userId: string): Promise<string> {
     const cachedRoomID = await this.loadPersistedDMRoomID(userId);
     if (cachedRoomID) {
-      return this.encodeThreadId({ roomID: cachedRoomID });
+      if (this.isUsableDirectRoom(cachedRoomID)) {
+        return this.encodeThreadId({ roomID: cachedRoomID });
+      }
+      await this.clearPersistedDMRoomID(userId);
     }
 
     const direct = await this.loadDirectAccountData();
@@ -1076,6 +1087,14 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     return normalized ?? null;
   }
 
+  private async clearPersistedDMRoomID(userID: string): Promise<void> {
+    if (!this.stateAdapter) {
+      return;
+    }
+
+    await this.stateAdapter.delete(this.getDMStorageKey(userID));
+  }
+
   private async persistDMRoomID(userID: string, roomID: string): Promise<void> {
     if (!this.stateAdapter) {
       return;
@@ -1177,11 +1196,28 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     roomID: string,
     existing: DirectAccountData
   ): Promise<void> {
-    const updated: DirectAccountData = { ...existing };
-    const existingRooms = updated[userID] ?? [];
+    const latest = await this.loadLatestDirectAccountData(existing);
+    const existingRooms = latest[userID] ?? [];
     if (!existingRooms.includes(roomID)) {
-      updated[userID] = [...existingRooms, roomID];
+      const updated: DirectAccountData = {
+        ...latest,
+        [userID]: [...existingRooms, roomID],
+      };
       await this.requireClient().setAccountData(EventType.Direct, updated);
+    }
+  }
+
+  private async loadLatestDirectAccountData(
+    fallback: DirectAccountData
+  ): Promise<DirectAccountData> {
+    try {
+      const direct = await this.requireClient().getAccountDataFromServer(EventType.Direct);
+      return this.normalizeDirectAccountData(direct);
+    } catch (error) {
+      this.logger.debug("Failed to refresh m.direct before writing; using cached snapshot", {
+        error,
+      });
+      return fallback;
     }
   }
 
@@ -1195,7 +1231,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
         deviceID: whoami.deviceID ?? this.deviceID,
       };
       await Promise.all([
-        this.persistDeviceIDForResolvedUser(userID),
+        this.persistDeviceIDForResolvedUser(userID, resolved.deviceID),
         this.persistSession(resolved),
       ]);
       return resolved;
@@ -2610,7 +2646,48 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     if (!("files" in message) || !Array.isArray(message.files)) {
       return [];
     }
-    return message.files.filter((file): file is FileUpload => isRecord(file));
+    return message.files.flatMap((file): FileUpload[] => {
+      const normalized = this.normalizeFileUpload(file);
+      return normalized ? [normalized] : [];
+    });
+  }
+
+  private normalizeFileUpload(file: unknown): FileUpload | null {
+    if (!isRecord(file)) {
+      return null;
+    }
+
+    const filename = normalizeOptionalString(
+      typeof file.filename === "string" ? file.filename : undefined
+    );
+    if (!filename) {
+      return null;
+    }
+
+    const data = this.normalizeFileUploadData(file.data);
+    if (!data) {
+      this.logger.warn("Skipping invalid Matrix file upload", { filename });
+      return null;
+    }
+
+    return {
+      filename,
+      data,
+      mimeType:
+        typeof file.mimeType === "string" ? normalizeOptionalString(file.mimeType) : undefined,
+    };
+  }
+
+  private normalizeFileUploadData(data: unknown): Buffer | Blob | ArrayBuffer | null {
+    if (Buffer.isBuffer(data) || data instanceof Blob || data instanceof ArrayBuffer) {
+      return data;
+    }
+
+    if (data instanceof Uint8Array) {
+      return Buffer.from(data);
+    }
+
+    return null;
   }
 
   private extractAttachmentsFromMessage(message: AdapterPostableMessage): Attachment[] {
@@ -2705,6 +2782,45 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       throw new Error(`Sent Matrix event not found in local timeline: ${eventID}`);
     }
     return event;
+  }
+
+  private resolveSentEvent(
+    roomID: string,
+    eventID: string,
+    fallback: {
+      content: MatrixRoomMessageContent;
+      roomID: string;
+      sender?: string;
+    }
+  ): MatrixEvent {
+    try {
+      return this.mustGetEventByID(roomID, eventID);
+    } catch (error) {
+      this.logger.warn("Sent Matrix event not found in local timeline; using synthetic fallback", {
+        error,
+        eventId: eventID,
+        roomId: roomID,
+      });
+
+      return new MatrixEvent({
+        content: fallback.content,
+        event_id: eventID,
+        origin_server_ts: Date.now(),
+        room_id: fallback.roomID,
+        sender: fallback.sender ?? "",
+        type: EventType.RoomMessage,
+      });
+    }
+  }
+
+  private isUsableDirectRoom(roomID: string): boolean {
+    const room = this.requireClient().getRoom(roomID);
+    if (!room) {
+      return false;
+    }
+
+    const membership = room.getMyMembership();
+    return membership === "join" || membership === "invite";
   }
 
   private makeUser(userId: string, roomId?: string) {

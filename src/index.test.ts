@@ -1084,6 +1084,53 @@ describe("MatrixAdapter", () => {
     );
   });
 
+  it("skips invalid file uploads instead of passing malformed entries downstream", async () => {
+    const fakeClient = makeClient();
+    const logger = makeTestLogger();
+    const adapter = new MatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
+      logger: logger.logger,
+      createClient: () => asMatrixClient(fakeClient),
+    });
+    await adapter.initialize(makeChatInstance());
+
+    await adapter.postMessage("matrix:!room%3Abeeper.com", {
+      files: [
+        { data: new Uint8Array([1, 2, 3]), filename: "valid.bin" },
+        { data: new Uint8Array([4, 5, 6]), filename: "   " },
+        { data: "not-binary", filename: "invalid.txt" },
+      ],
+    } as never);
+
+    expect(fakeClient.uploadContent).toHaveBeenCalledTimes(1);
+    expect(fakeClient.uploadContent).toHaveBeenCalledWith(
+      expect.any(Blob),
+      expect.objectContaining({ name: "valid.bin" })
+    );
+    expect(logger.warn).toHaveBeenCalledWith("Skipping invalid Matrix file upload", {
+      filename: "invalid.txt",
+    });
+  });
+
+  it("falls back to a synthetic MatrixEvent when a sent event is not yet in the timeline", async () => {
+    const fakeClient = makeClient();
+    fakeClient.getRoom.mockReturnValue(
+      makeRoom({
+        findEventById: () => null,
+      })
+    );
+    fakeClient.sendEvent.mockResolvedValue({ event_id: "$missing" });
+
+    const adapter = await makeInitializedAdapter(fakeClient);
+    const sent = await adapter.postMessage("matrix:!room%3Abeeper.com", "hello");
+
+    expect(sent.id).toBe("$missing");
+    expect(sent.raw.getId()).toBe("$missing");
+    expect(sent.raw.getRoomId()).toBe("!room:beeper.com");
+    expect(sent.raw.getContent()).toMatchObject({ body: "hello", msgtype: "m.text" });
+  });
+
   it("logs and rethrows Matrix send failures", async () => {
     const fakeClient = makeClient();
     const logger = makeTestLogger();
@@ -1455,6 +1502,7 @@ describe("MatrixAdapter", () => {
       auth: {
         type: "accessToken",
         accessToken: "token",
+        userID: "@bot:beeper.com",
       },
       deviceID: "DEVICE_FALLBACK",
       createBootstrapClient: () =>
@@ -1960,6 +2008,59 @@ describe("MatrixAdapter", () => {
 
     expect(threadID).toBe("matrix:!active-dm%3Abeeper.com");
     expect(fakeClient.createRoom).not.toHaveBeenCalled();
+  });
+
+  it("openDM clears stale cached mappings before creating a fresh DM", async () => {
+    const fakeClient = makeClient();
+    fakeClient.getRoom.mockImplementation((roomID?: string) => {
+      if (roomID === "!stale-dm:beeper.com") {
+        return null;
+      }
+      return makeRoom({ roomId: roomID ?? "!room:beeper.com" });
+    });
+    fakeClient.getAccountDataFromServer.mockResolvedValue({});
+    fakeClient.createRoom.mockResolvedValue({ room_id: "!fresh-dm:beeper.com" });
+
+    const state = makeStateAdapter({
+      "matrix:dm:%40bob%3Abeeper.com": "!stale-dm:beeper.com",
+    });
+    const adapter = new MatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
+      createClient: () => asMatrixClient(fakeClient),
+    });
+
+    await adapter.initialize(makeChatInstance({ state }));
+    const threadId = await adapter.openDM("@bob:beeper.com");
+
+    expect(threadId).toBe("matrix:!fresh-dm%3Abeeper.com");
+    expect(state.delete).toHaveBeenCalledWith("matrix:dm:%40bob%3Abeeper.com");
+    expect(fakeClient.createRoom).toHaveBeenCalledOnce();
+  });
+
+  it("merges fresh m.direct account data before persisting a newly created DM", async () => {
+    const fakeClient = makeClient();
+    fakeClient.getAccountDataFromServer
+      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({
+        "@bob:beeper.com": ["!existing-dm:beeper.com"],
+        "@carol:beeper.com": ["!carol-dm:beeper.com"],
+      });
+    fakeClient.createRoom.mockResolvedValue({ room_id: "!new-dm:beeper.com" });
+
+    const adapter = new MatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
+      createClient: () => asMatrixClient(fakeClient),
+    });
+
+    await adapter.initialize(makeChatInstance({ state: makeStateAdapter() }));
+    await adapter.openDM("@bob:beeper.com");
+
+    expect(fakeClient.setAccountData).toHaveBeenCalledWith(EventType.Direct, {
+      "@bob:beeper.com": ["!existing-dm:beeper.com", "!new-dm:beeper.com"],
+      "@carol:beeper.com": ["!carol-dm:beeper.com"],
+    });
   });
 
   it("lists threads using server-side thread API with mxv1 cursor", async () => {

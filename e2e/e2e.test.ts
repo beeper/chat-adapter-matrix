@@ -18,15 +18,17 @@ import {
   waitForRoom,
 } from "./helpers";
 
-const hasCredentials = Boolean(
+const hasCoreCredentials = Boolean(
   process.env.E2E_BASE_URL &&
     process.env.E2E_BOT_LOGIN_TOKEN &&
-    process.env.E2E_BOT_RECOVERY_KEY &&
-    process.env.E2E_SENDER_LOGIN_TOKEN &&
-    process.env.E2E_SENDER_RECOVERY_KEY
+    process.env.E2E_SENDER_LOGIN_TOKEN
 );
 
-describe.skipIf(!hasCredentials)("E2E Matrix Adapter", () => {
+const hasRecoveryCredentials = Boolean(
+  process.env.E2E_BOT_RECOVERY_KEY && process.env.E2E_SENDER_RECOVERY_KEY
+);
+
+describe.skipIf(!hasCoreCredentials)("E2E Matrix Adapter", () => {
   let bot: E2EParticipant;
   let sender: E2EParticipant;
   let roomID: string;
@@ -701,7 +703,9 @@ describe.skipIf(!hasCredentials)("E2E Matrix Adapter", () => {
     expect(fetchedAttachmentData?.toString("utf8")).toBe(expectedContents);
   });
 
-  it("restores historical encrypted messages on a fresh device using recovery key", async () => {
+  it.skipIf(!hasRecoveryCredentials)(
+    "restores historical encrypted messages on a fresh device using recovery key",
+    async () => {
     await shutdownParticipant(sender);
 
     const tag = `e2e-recovery-${nonce()}`;
@@ -731,7 +735,8 @@ describe.skipIf(!hasCredentials)("E2E Matrix Adapter", () => {
     expect(restoredMessage.text).toContain(tag);
     expect(restoredMessage.author.userId).toBe(bot.userID);
     expect(restoredMessage.raw.isEncrypted()).toBe(true);
-  });
+    }
+  );
 
   it("emits typing notifications", async () => {
     const threadId = bot.adapter.encodeThreadId({ roomID });
