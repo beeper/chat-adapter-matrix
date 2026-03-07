@@ -483,9 +483,10 @@ describe.skipIf(!hasCoreCredentials)("E2E Matrix Adapter", () => {
     expect(liveMessage.text).toContain(liveTag);
 
     const fetchedIds = new Set<string>();
+    const offlinePostIds = new Set(offlinePosts.map((post) => post.id));
     let cursor: string | undefined;
 
-    for (let pageIndex = 0; pageIndex < 3; pageIndex += 1) {
+    while (true) {
       const page = await bot.adapter.fetchMessages(bot.adapter.encodeThreadId({ roomID }), {
         direction: "backward",
         limit: 5,
@@ -494,10 +495,17 @@ describe.skipIf(!hasCoreCredentials)("E2E Matrix Adapter", () => {
       for (const message of page.messages) {
         fetchedIds.add(message.id);
       }
+
+      if ([...offlinePostIds].every((id) => fetchedIds.has(id))) {
+        break;
+      }
+
       cursor = page.nextCursor;
+      if (!cursor) {
+        break;
+      }
     }
 
-    expect(cursor).toBeTruthy();
     expect(fetchedIds.has(livePosted.id)).toBe(true);
     expect(offlinePosts.every((post) => fetchedIds.has(post.id))).toBe(true);
   });

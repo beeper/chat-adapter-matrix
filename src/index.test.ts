@@ -294,18 +294,9 @@ function makeRoomMembers(
 
 function makeStateAdapter(initial: Record<string, unknown> = {}): StateAdapter {
   const base = createMemoryState();
-  let ready = Promise.resolve();
-  const afterReady = async <T>(run: () => Promise<T>): Promise<T> => {
-    await ready;
-    return run();
-  };
-  const get: StateAdapter["get"] = (key) => afterReady(() => base.get(key));
-  const set: StateAdapter["set"] = (key, value, ttlMs) =>
-    afterReady(() => base.set(key, value, ttlMs));
-  const setIfNotExists: StateAdapter["setIfNotExists"] = (key, value, ttlMs) =>
-    afterReady(() => base.setIfNotExists(key, value, ttlMs));
+  let ready: Promise<void> | null = null;
   const connect: StateAdapter["connect"] = async () => {
-    ready = (async () => {
+    ready ??= (async () => {
       await base.connect();
       for (const [key, value] of Object.entries(initial)) {
         await base.set(key, value);
@@ -313,6 +304,15 @@ function makeStateAdapter(initial: Record<string, unknown> = {}): StateAdapter {
     })();
     await ready;
   };
+  const afterReady = async <T>(run: () => Promise<T>): Promise<T> => {
+    await (ready ?? connect());
+    return run();
+  };
+  const get: StateAdapter["get"] = (key) => afterReady(() => base.get(key));
+  const set: StateAdapter["set"] = (key, value, ttlMs) =>
+    afterReady(() => base.set(key, value, ttlMs));
+  const setIfNotExists: StateAdapter["setIfNotExists"] = (key, value, ttlMs) =>
+    afterReady(() => base.setIfNotExists(key, value, ttlMs));
 
   return {
     acquireLock: vi.fn((threadId, ttlMs) =>
