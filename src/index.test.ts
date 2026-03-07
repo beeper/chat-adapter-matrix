@@ -294,12 +294,7 @@ function makeRoomMembers(
 
 function makeStateAdapter(initial: Record<string, unknown> = {}): StateAdapter {
   const base = createMemoryState();
-  const ready = (async () => {
-    await base.connect();
-    for (const [key, value] of Object.entries(initial)) {
-      await base.set(key, value);
-    }
-  })();
+  let ready = Promise.resolve();
   const afterReady = async <T>(run: () => Promise<T>): Promise<T> => {
     await ready;
     return run();
@@ -309,12 +304,21 @@ function makeStateAdapter(initial: Record<string, unknown> = {}): StateAdapter {
     afterReady(() => base.set(key, value, ttlMs));
   const setIfNotExists: StateAdapter["setIfNotExists"] = (key, value, ttlMs) =>
     afterReady(() => base.setIfNotExists(key, value, ttlMs));
+  const connect: StateAdapter["connect"] = async () => {
+    ready = (async () => {
+      await base.connect();
+      for (const [key, value] of Object.entries(initial)) {
+        await base.set(key, value);
+      }
+    })();
+    await ready;
+  };
 
   return {
     acquireLock: vi.fn((threadId, ttlMs) =>
       afterReady(() => base.acquireLock(threadId, ttlMs))
     ),
-    connect: vi.fn(() => afterReady(() => base.connect())),
+    connect: vi.fn(connect),
     delete: vi.fn((key) => afterReady(() => base.delete(key))),
     disconnect: vi.fn(() => afterReady(() => base.disconnect())),
     extendLock: vi.fn((lock, ttlMs) =>
@@ -576,18 +580,23 @@ describe("MatrixAdapter", () => {
 
     await adapter.initialize(makeChatInstance());
     const timelineHandler = fakeClient.__handlers.get("Room.timeline");
+    vi.useFakeTimers();
 
-    timelineHandler?.(
-      makeEvent({
-        getType: () => EventType.RoomMember,
-        getSender: () => "@alice:beeper.com",
-        getStateKey: () => "@bot:beeper.com",
-        getContent: () => ({ membership: "invite" }),
-      }),
-      { roomId: "!invited:beeper.com" },
-      false
-    );
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    try {
+      timelineHandler?.(
+        makeEvent({
+          getType: () => EventType.RoomMember,
+          getSender: () => "@alice:beeper.com",
+          getStateKey: () => "@bot:beeper.com",
+          getContent: () => ({ membership: "invite" }),
+        }),
+        { roomId: "!invited:beeper.com" },
+        false
+      );
+      await vi.runAllTimersAsync();
+    } finally {
+      vi.useRealTimers();
+    }
 
     expect(fakeClient.joinRoom).toHaveBeenCalledTimes(2);
     expect(fakeClient.joinRoom).toHaveBeenNthCalledWith(1, "!invited:beeper.com");
@@ -2057,7 +2066,7 @@ describe("MatrixAdapter", () => {
     }
   });
 
-  it("openDM reuses cached mapping, then m.direct mapping, then creates and persists", async () => {
+  it("openDM reuses a cached mapping", async () => {
     const fakeClient = makeClient();
     const cachedState = makeStateAdapter({
       "matrix:dm:%40bob%3Abeeper.com": "!cached-dm:beeper.com",
@@ -2071,7 +2080,11 @@ describe("MatrixAdapter", () => {
     const cachedThread = await adapterFromCache.openDM("@bob:beeper.com");
     expect(cachedThread).toBe("matrix:!cached-dm%3Abeeper.com");
     expect(fakeClient.createRoom).not.toHaveBeenCalled();
+    expect(fakeClient.setAccountData).not.toHaveBeenCalled();
+  });
 
+  it("openDM reuses the m.direct mapping and caches it locally", async () => {
+    const fakeClient = makeClient();
     const directState = makeStateAdapter();
     fakeClient.getAccountDataFromServer.mockResolvedValue({
       "@bob:beeper.com": ["!from-direct:beeper.com"],
@@ -2088,7 +2101,12 @@ describe("MatrixAdapter", () => {
       "matrix:dm:%40bob%3Abeeper.com",
       "!from-direct:beeper.com"
     );
+    expect(fakeClient.createRoom).not.toHaveBeenCalled();
+    expect(fakeClient.setAccountData).not.toHaveBeenCalled();
+  });
 
+  it("openDM creates and persists a DM when no mapping exists", async () => {
+    const fakeClient = makeClient();
     const createState = makeStateAdapter();
     fakeClient.getAccountDataFromServer.mockResolvedValue({});
     fakeClient.createRoom.mockResolvedValue({ room_id: "!created-dm:beeper.com" });
