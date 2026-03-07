@@ -31,6 +31,7 @@ import {
 import sdk, {
   Direction,
   MatrixEvent,
+  type ICreateClientOpts,
   type MatrixClient,
   type IEvent,
   type IThreadBundledRelationship,
@@ -45,6 +46,7 @@ import sdk, {
   ThreadFilterType,
   THREAD_RELATION_TYPE,
 } from "matrix-js-sdk";
+import type { IStore } from "matrix-js-sdk/lib/store";
 import type {
   RoomMessageEventContent,
   RoomMessageTextEventContent,
@@ -60,11 +62,14 @@ import {
   parse as parseHTML,
   type Node as HTMLNode,
 } from "node-html-parser";
+import { ChatStateMatrixStore } from "./store/chat-state-matrix-store";
 import type {
   MatrixAuthBootstrapClient,
   MatrixAccessTokenAuthConfig,
   MatrixAdapterConfig,
   MatrixAuthConfig,
+  MatrixCreateStoreOptions,
+  MatrixSyncStoreConfig,
   MatrixThreadID,
 } from "./types";
 
@@ -72,9 +77,11 @@ const MATRIX_PREFIX = "matrix";
 const MATRIX_DEVICE_PREFIX = "matrix:device";
 const MATRIX_DM_PREFIX = "matrix:dm";
 const MATRIX_SESSION_PREFIX = "matrix:session";
+const MATRIX_STORE_PREFIX = "matrix:store:v1";
 const MATRIX_CURSOR_PREFIX = "mxv1:";
 const DEFAULT_COMMAND_PREFIX = "/";
 const TYPING_TIMEOUT_MS = 30_000;
+const DEFAULT_MATRIX_STORE_PERSIST_INTERVAL_MS = 30_000;
 const FAST_SYNC_DEFAULTS: NonNullable<MatrixAdapterConfig["sync"]> = {
   initialSyncLimit: 1,
   lazyLoadMembers: true,
@@ -129,6 +136,13 @@ type ResolvedAuth = {
   accessToken: string;
   deviceID?: string;
   userID: string;
+};
+
+type ResolvedMatrixStoreConfig = {
+  enabled: boolean;
+  keyPrefix: string;
+  persistIntervalMs: number;
+  snapshotTtlMs?: number;
 };
 
 type StoredSession = {
@@ -223,8 +237,10 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   private readonly inviteAutoJoinInviterAllowlist?: Set<string>;
   private readonly syncOptions?: MatrixAdapterConfig["sync"];
   private readonly createClientFn?: MatrixAdapterConfig["createClient"];
+  private readonly createStoreFn?: MatrixAdapterConfig["createStore"];
   private readonly createBootstrapClientFn?: MatrixAdapterConfig["createBootstrapClient"];
   private readonly e2eeConfig?: MatrixAdapterConfig["e2ee"];
+  private readonly matrixStoreConfig: ResolvedMatrixStoreConfig;
   private readonly recoveryKey?: string;
   private readonly matrixSDKLogLevel?: MatrixAdapterConfig["matrixSDKLogLevel"];
   private readonly deviceIDPersistence: DeviceIDPersistenceConfig;
@@ -241,12 +257,15 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   private chat: ChatInstance | null = null;
   private stateAdapter: StateAdapter | null = null;
   private client: MatrixClient | null = null;
+  private matrixStoreScopeKey: string | null = null;
   private started = false;
   private userID: string;
   private deviceID?: string;
   private readonly reactionByEventID = new Map<string, StoredReaction>();
   private readonly myReactionByKey = new Map<string, string>();
   private readonly processedTimelineEventIDs = new Set<string>();
+  private lastSecretsBundlePersistAt = 0;
+  private secretsBundleUnavailableLogged = false;
   private liveSyncReady = false;
   private shuttingDown = false;
 
@@ -272,12 +291,24 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
         : undefined;
     this.syncOptions = config.sync ?? FAST_SYNC_DEFAULTS;
     this.createClientFn = config.createClient;
+    this.createStoreFn = config.createStore;
     this.createBootstrapClientFn = config.createBootstrapClient;
     this.e2eeConfig = {
       ...config.e2ee,
       enabled: config.e2ee?.enabled ?? Boolean(config.recoveryKey),
+      persistSecretsBundle:
+        config.e2ee?.persistSecretsBundle ??
+        Boolean(config.matrixStore?.enabled && (config.e2ee?.enabled ?? Boolean(config.recoveryKey))),
       storagePassword:
         config.e2ee?.storagePassword ?? config.recoveryKey,
+    };
+    this.matrixStoreConfig = {
+      enabled: config.matrixStore?.enabled ?? false,
+      keyPrefix: normalizeOptionalString(config.matrixStore?.keyPrefix) ?? MATRIX_STORE_PREFIX,
+      persistIntervalMs:
+        config.matrixStore?.persistIntervalMs ??
+        DEFAULT_MATRIX_STORE_PERSIST_INTERVAL_MS,
+      snapshotTtlMs: config.matrixStore?.snapshotTtlMs,
     };
     this.recoveryKey = normalizeOptionalString(config.recoveryKey);
     this.matrixSDKLogLevel = config.matrixSDKLogLevel;
@@ -309,13 +340,24 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     this.configureMatrixSDKLogging();
     await this.resolveDeviceID();
 
+    let resolvedAuth: ResolvedAuth | null = null;
     if (this.createClientFn) {
-      this.client = this.createClientFn();
+      const store = await this.maybeCreateMatrixStore();
+      if (this.persistSecretsBundleEnabled) {
+        this.matrixStoreScopeKey = this.resolveMatrixStoreContext()?.scopeKey ?? null;
+      }
+      const clientOptions = this.buildCustomClientOptions(store);
+      this.client = this.createClientFn(clientOptions);
     } else {
-      const resolvedAuth = await this.resolveAuth();
+      resolvedAuth = await this.resolveAuth();
       this.userID = resolvedAuth.userID;
       this.deviceID = normalizeOptionalString(resolvedAuth.deviceID) ?? this.deviceID;
-      this.client = this.buildClient(resolvedAuth);
+      const store = await this.maybeCreateMatrixStore(resolvedAuth);
+      if (!store && this.persistSecretsBundleEnabled) {
+        this.matrixStoreScopeKey =
+          this.resolveMatrixStoreContext(resolvedAuth)?.scopeKey ?? null;
+      }
+      this.client = this.buildClient(resolvedAuth, store);
     }
 
     this.client.on(ClientEvent.Sync, (state: string) => {
@@ -356,10 +398,13 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
 
     this.shuttingDown = true;
     try {
+      await this.maybePersistSecretsBundle(true);
+      await this.maybeFlushMatrixStore();
       this.client.removeAllListeners();
       this.client.stopClient();
       this.reactionByEventID.clear();
       this.myReactionByKey.clear();
+      this.client = null;
       this.started = false;
       this.logger.info("Matrix adapter shutdown complete");
     } finally {
@@ -1316,7 +1361,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     return { userID, deviceID };
   }
 
-  private buildClient(auth: ResolvedAuth): MatrixClient {
+  private buildClient(auth: ResolvedAuth, store?: IStore): MatrixClient {
     const cryptoCallbacks =
       this.recoveryKey && this.e2eeConfig?.enabled
         ? {
@@ -1333,6 +1378,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       userId: auth.userID,
       deviceId: auth.deviceID,
       cryptoCallbacks,
+      store,
     });
   }
 
@@ -1359,6 +1405,100 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       loginWithPassword: client.loginWithPassword.bind(client),
       whoami: client.whoami.bind(client),
     };
+  }
+
+  private buildCustomClientOptions(store?: IStore): ICreateClientOpts | undefined {
+    if (!store) {
+      return undefined;
+    }
+
+    const customUserID =
+      normalizeOptionalString(this.auth.userID) ??
+      normalizeOptionalString(this.userID);
+
+    return {
+      baseUrl: this.baseURL,
+      accessToken:
+        this.auth.type === "accessToken" ? this.auth.accessToken : undefined,
+      userId: customUserID,
+      deviceId: this.deviceID,
+      store,
+    };
+  }
+
+  private async maybeCreateMatrixStore(resolvedAuth?: ResolvedAuth): Promise<IStore | undefined> {
+    if (!this.stateAdapter || !this.matrixStoreConfig.enabled) {
+      return undefined;
+    }
+
+    const storeContext = this.resolveMatrixStoreContext(resolvedAuth);
+    if (!storeContext) {
+      return undefined;
+    }
+
+    const { scopeKey, userID, deviceID } = storeContext;
+    this.matrixStoreScopeKey = scopeKey;
+
+    const createStoreOptions: MatrixCreateStoreOptions = {
+      baseURL: this.baseURL,
+      config: { ...this.matrixStoreConfig },
+      deviceID,
+      logger: this.logger,
+      scopeKey,
+      state: this.stateAdapter,
+      userID,
+    };
+
+    if (this.createStoreFn) {
+      return this.createStoreFn(createStoreOptions);
+    }
+
+    return new ChatStateMatrixStore({
+      state: this.stateAdapter,
+      scopeKey,
+      logger: this.logger,
+      persistIntervalMs: this.matrixStoreConfig.persistIntervalMs,
+      snapshotTtlMs: this.matrixStoreConfig.snapshotTtlMs,
+    });
+  }
+
+  private resolveMatrixStoreContext(
+    resolvedAuth?: ResolvedAuth
+  ): { deviceID?: string; scopeKey: string; userID: string } | null {
+    const userID = normalizeOptionalString(resolvedAuth?.userID) ??
+      normalizeOptionalString(this.auth.userID) ??
+      normalizeOptionalString(this.userID);
+    if (!userID) {
+      this.logger.warn(
+        "Matrix sync store is enabled, but no user ID is available for store scoping. Continuing without persistent sync store."
+      );
+      return null;
+    }
+
+    const deviceID = normalizeOptionalString(resolvedAuth?.deviceID) ?? this.deviceID;
+    return {
+      userID,
+      deviceID,
+      scopeKey: this.buildMatrixStoreScopeKey(userID, deviceID),
+    };
+  }
+
+  private buildMatrixStoreScopeKey(userID: string, deviceID?: string): string {
+    const keyPrefix = this.matrixStoreConfig.keyPrefix;
+    return `${keyPrefix}:${encodeURIComponent(this.baseURL)}:${encodeURIComponent(userID)}:${encodeURIComponent(deviceID ?? "default")}`;
+  }
+
+  private async maybeFlushMatrixStore(): Promise<void> {
+    const store = this.client?.store as { save?: (force?: boolean) => Promise<void> } | undefined;
+    if (!store?.save) {
+      return;
+    }
+
+    try {
+      await store.save(true);
+    } catch (error) {
+      this.logger.warn("Failed to flush Matrix sync store during shutdown", { error });
+    }
   }
 
   private dispatchTimelineEvent(
@@ -1394,7 +1534,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     rootEventID: string | undefined,
     content: MatrixOutboundMessageContent
   ) {
-    return this.withLoggedMatrixOperation(
+    const response = await this.withLoggedMatrixOperation(
       "Matrix send message failed",
       {
         roomId: roomID,
@@ -1411,6 +1551,8 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
         return client.sendEvent(roomID, EventType.RoomMessage, content);
       }
     );
+    void this.maybePersistSecretsBundle();
+    return response;
   }
 
   private async toRoomMessageContents(
@@ -1485,7 +1627,9 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       storagePassword: this.e2eeConfig.storagePassword,
       storageKey: this.e2eeConfig.storageKey,
     });
+    await this.maybeImportPersistedSecretsBundle();
     void this.maybeLoadKeyBackupFromRecoveryKey();
+    void this.maybePersistSecretsBundle();
 
     this.logger.info("Matrix E2EE initialized", {
       useIndexedDB: useIndexedDB !== false,
@@ -1515,6 +1659,95 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     }
   }
 
+  private get persistSecretsBundleEnabled(): boolean {
+    return Boolean(this.e2eeConfig?.enabled && this.e2eeConfig?.persistSecretsBundle);
+  }
+
+  private getSecretsBundleStorageKey(): string | null {
+    if (!this.persistSecretsBundleEnabled || !this.matrixStoreScopeKey) {
+      return null;
+    }
+
+    return `${this.matrixStoreScopeKey}:secrets-bundle`;
+  }
+
+  private async maybeImportPersistedSecretsBundle(): Promise<void> {
+    if (!this.stateAdapter) {
+      return;
+    }
+
+    const storageKey = this.getSecretsBundleStorageKey();
+    if (!storageKey) {
+      return;
+    }
+
+    const crypto = this.requireClient().getCrypto();
+    if (!crypto?.importSecretsBundle) {
+      return;
+    }
+
+    try {
+      const bundle = await this.stateAdapter.get<unknown>(storageKey);
+      if (!bundle) {
+        return;
+      }
+
+      await crypto.importSecretsBundle(bundle as Parameters<
+        NonNullable<NonNullable<typeof crypto>["importSecretsBundle"]>
+      >[0]);
+      this.logger.info("Imported persisted Matrix secrets bundle");
+    } catch (error) {
+      this.logger.warn("Failed to import persisted Matrix secrets bundle", { error });
+    }
+  }
+
+  private async maybePersistSecretsBundle(force = false): Promise<void> {
+    if (!this.stateAdapter) {
+      return;
+    }
+
+    const storageKey = this.getSecretsBundleStorageKey();
+    if (!storageKey) {
+      return;
+    }
+
+    const crypto = this.client?.getCrypto();
+    if (!crypto?.exportSecretsBundle) {
+      return;
+    }
+
+    const now = Date.now();
+    if (!force && now - this.lastSecretsBundlePersistAt < 60_000) {
+      return;
+    }
+
+    try {
+      const bundle = await crypto.exportSecretsBundle();
+      await this.stateAdapter.set(storageKey, bundle);
+      this.lastSecretsBundlePersistAt = now;
+      this.secretsBundleUnavailableLogged = false;
+      if (force) {
+        this.logger.debug("Persisted Matrix secrets bundle during shutdown");
+      }
+    } catch (error) {
+      if (this.isExpectedSecretsBundleUnavailableError(error)) {
+        if (!this.secretsBundleUnavailableLogged) {
+          this.logger.debug(
+            "Skipping Matrix secrets bundle persistence because cross-signing secrets are not available yet"
+          );
+          this.secretsBundleUnavailableLogged = true;
+        }
+        return;
+      }
+      this.logger.warn("Failed to persist Matrix secrets bundle", { error });
+    }
+  }
+
+  private isExpectedSecretsBundleUnavailableError(error: unknown): boolean {
+    return error instanceof Error &&
+      error.message.includes("cross-signing keys");
+  }
+
   private async tryDecryptEvent(event: MatrixEvent): Promise<void> {
     if (!this.e2eeConfig?.enabled) {
       return;
@@ -1526,6 +1759,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
 
     try {
       await this.requireClient().decryptEventIfNeeded(event);
+      void this.maybePersistSecretsBundle();
     } catch (error) {
       this.logger.warn("Failed to decrypt Matrix event", {
         eventId: event.getId(),
@@ -3012,6 +3246,18 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       throw new Error("session.ttlMs must be a positive number.");
     }
     if (
+      config.matrixStore?.persistIntervalMs !== undefined &&
+      config.matrixStore.persistIntervalMs <= 0
+    ) {
+      throw new Error("matrixStore.persistIntervalMs must be a positive number.");
+    }
+    if (
+      config.matrixStore?.snapshotTtlMs !== undefined &&
+      config.matrixStore.snapshotTtlMs <= 0
+    ) {
+      throw new Error("matrixStore.snapshotTtlMs must be a positive number.");
+    }
+    if (
       (config.session?.encrypt && !config.session?.decrypt) ||
       (!config.session?.encrypt && config.session?.decrypt)
     ) {
@@ -3199,7 +3445,12 @@ export function createMatrixAdapter(config?: MatrixAdapterConfig): MatrixAdapter
   });
 }
 
-export type { MatrixAdapterConfig, MatrixThreadID } from "./types";
+export type {
+  MatrixAdapterConfig,
+  MatrixCreateStoreOptions,
+  MatrixSyncStoreConfig,
+  MatrixThreadID,
+} from "./types";
 
 function resolveAuthFromEnv(): MatrixAuthConfig {
   const username = process.env.MATRIX_USERNAME;

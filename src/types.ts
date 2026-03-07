@@ -1,12 +1,31 @@
-import type { IStartClientOpts, MatrixClient } from "matrix-js-sdk";
-import type { Logger } from "chat";
+import type { ICreateClientOpts, IStartClientOpts, MatrixClient } from "matrix-js-sdk";
+import type { Logger, StateAdapter } from "chat";
+import type { IStore } from "matrix-js-sdk/lib/store";
 
 export interface MatrixE2EEConfig {
   cryptoDatabasePrefix?: string;
   enabled?: boolean;
+  persistSecretsBundle?: boolean;
   storageKey?: Uint8Array;
   storagePassword?: string;
   useIndexedDB?: boolean;
+}
+
+export interface MatrixSyncStoreConfig {
+  enabled?: boolean;
+  keyPrefix?: string;
+  persistIntervalMs?: number;
+  snapshotTtlMs?: number;
+}
+
+export interface MatrixCreateStoreOptions {
+  baseURL: string;
+  config: MatrixSyncStoreConfig;
+  deviceID?: string;
+  logger: Logger;
+  scopeKey: string;
+  state: StateAdapter;
+  userID: string;
 }
 
 export interface MatrixAccessTokenAuthConfig {
@@ -31,15 +50,17 @@ export interface MatrixAdapterConfig {
   auth: MatrixAuthConfig;
   baseURL: string;
   commandPrefix?: string;
+  createStore?: (options: MatrixCreateStoreOptions) => IStore;
   createBootstrapClient?: (
     options: { accessToken?: string; baseURL: string; deviceID?: string }
   ) => MatrixAuthBootstrapClient;
-  createClient?: () => MatrixClient;
+  createClient?: (options?: ICreateClientOpts) => MatrixClient;
   deviceIDPersistence?: MatrixDeviceIDPersistenceConfig;
   deviceID?: string;
   e2ee?: MatrixE2EEConfig;
   inviteAutoJoin?: MatrixInviteAutoJoinConfig;
   logger?: Logger;
+  matrixStore?: MatrixSyncStoreConfig;
   matrixSDKLogLevel?: "trace" | "debug" | "info" | "warn" | "error";
   recoveryKey?: string;
   roomAllowlist?: string[];

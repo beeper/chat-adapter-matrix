@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { Chat, type Message, type ReactionEvent, type StateAdapter } from "chat";
 import { createMemoryState } from "@chat-adapter/state-memory";
+import { createRedisState } from "@chat-adapter/state-redis";
 import { EventType } from "matrix-js-sdk";
 import type { MatrixClient, MatrixEvent, Room } from "matrix-js-sdk";
 import { MatrixAdapter } from "../src/index";
@@ -23,6 +24,9 @@ export const env = {
   },
   get roomID(): string | undefined {
     return process.env.E2E_ROOM_ID || undefined;
+  },
+  get redisURL(): string | undefined {
+    return process.env.E2E_REDIS_URL || undefined;
   },
 };
 
@@ -56,7 +60,7 @@ export async function createParticipantFromSession(opts: {
   session: MatrixLoginResponse;
   state?: StateAdapter;
 }): Promise<E2EParticipant> {
-  const state = opts.state ?? createMemoryState();
+  const state = opts.state ?? createE2EState(opts.name);
   const adapter = new MatrixAdapter({
     baseURL: env.baseURL,
     auth: {
@@ -69,6 +73,9 @@ export async function createParticipantFromSession(opts: {
     e2ee: {
       enabled: true,
       useIndexedDB: false,
+    },
+    matrixStore: {
+      enabled: true,
     },
     recoveryKey: opts.recoveryKey,
   });
@@ -108,6 +115,17 @@ export async function createParticipantFromSession(opts: {
     onMessage: (cb) => { messageCallback = cb; },
     onReaction: (cb) => { reactionCallback = cb; },
   };
+}
+
+function createE2EState(name: string): StateAdapter {
+  if (env.redisURL) {
+    return createRedisState({
+      url: env.redisURL,
+      keyPrefix: `matrix-chat-adapter-e2e:${name}`,
+    });
+  }
+
+  return createMemoryState();
 }
 
 export async function shutdownParticipant(participant: E2EParticipant): Promise<void> {
@@ -307,7 +325,15 @@ export async function waitForFetchedMessage(
   const startedAt = Date.now();
 
   while (Date.now() - startedAt < timeoutMs) {
-    const message = await adapter.fetchMessage(threadId, messageId);
+    let message: Message<MatrixEvent> | null = null;
+    try {
+      message = await adapter.fetchMessage(threadId, messageId);
+    } catch (error) {
+      if (!isTransientMatrixError(error)) {
+        throw error;
+      }
+    }
+
     if (message && isDecryptedMessage(message) && predicate(message)) {
       return message;
     }
@@ -328,10 +354,25 @@ export async function waitForMatchingMessage(
   const startedAt = Date.now();
 
   while (Date.now() - startedAt < timeoutMs) {
-    const page = await adapter.fetchMessages(threadId, {
-      direction: "backward",
-      limit,
-    });
+    let page:
+      | Awaited<ReturnType<MatrixAdapter["fetchMessages"]>>
+      | null = null;
+    try {
+      page = await adapter.fetchMessages(threadId, {
+        direction: "backward",
+        limit,
+      });
+    } catch (error) {
+      if (!isTransientMatrixError(error)) {
+        throw error;
+      }
+    }
+
+    if (!page) {
+      await sleep(intervalMs);
+      continue;
+    }
+
     const match = page.messages.find(
       (message) => isDecryptedMessage(message) && predicate(message)
     );
@@ -371,4 +412,17 @@ export function nonce(): string {
 
 function isDecryptedMessage(message: Message<MatrixEvent>): boolean {
   return !message.text.startsWith("** Unable to decrypt:");
+}
+
+function isTransientMatrixError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  return (
+    error.message.includes("429") ||
+    error.message.includes("503") ||
+    error.message.includes("M_LIMIT_EXCEEDED") ||
+    error.message.includes("Server returned 503 error")
+  );
 }

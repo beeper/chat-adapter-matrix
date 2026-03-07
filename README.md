@@ -9,7 +9,7 @@ If you use Beeper, this adapter lets your Chat SDK bot work with your Matrix/Bee
 ## Installation
 
 ```bash
-npm install chat @beeper/chat-adapter-matrix matrix-js-sdk
+pnpm add chat @beeper/chat-adapter-matrix matrix-js-sdk
 ```
 
 ## Quick Start
@@ -109,13 +109,13 @@ Behavior:
 Copy [`examples/.env.example`](./examples/.env.example) to `examples/.env`, then run:
 
 ```bash
-npm run example:bun
+pnpm example
 ```
 
 If you need Beeper credentials, generate them interactively:
 
 ```bash
-npm run token:bun
+pnpm matrix-token
 ```
 
 The helper prints:
@@ -128,7 +128,7 @@ The helper prints:
 Then run:
 
 ```bash
-bun --env-file=examples/.env run examples/bot.ts
+pnpm example
 ```
 
 ## Capabilities

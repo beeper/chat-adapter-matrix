@@ -187,6 +187,13 @@ function getInternals(adapter: MatrixAdapter): AdapterInternals {
 
 function makeClient() {
   const handlers = new Map<string, (...args: unknown[]) => void>();
+  const store = {
+    save: vi.fn(async () => undefined),
+  };
+  const crypto = {
+    exportSecretsBundle: vi.fn(async () => ({ bundle: "secret" })),
+    importSecretsBundle: vi.fn(async () => undefined),
+  };
 
   const client = {
     on: (eventName: string, cb: (...args: unknown[]) => void) => {
@@ -213,6 +220,7 @@ function makeClient() {
       async (): Promise<Record<string, string[]> | null> => null
     ),
     getAccessToken: vi.fn(() => "token"),
+    getCrypto: vi.fn(() => crypto),
     getEventMapper: vi.fn(() => (raw: Record<string, unknown>) => mapRawToEvent(raw)),
     initRustCrypto: vi.fn(async () => undefined),
     mxcUrlToHttp: vi.fn((url: string) => url),
@@ -229,6 +237,8 @@ function makeClient() {
     getRoom: vi.fn((roomID?: string): RoomLike | null => makeRoom({
       roomId: roomID ?? "!room:beeper.com",
     })),
+    store,
+    __crypto: crypto,
     __handlers: handlers,
   };
 
@@ -297,6 +307,8 @@ function makeStateAdapter(initial: Record<string, unknown> = {}): StateAdapter {
   const get: StateAdapter["get"] = (key) => afterReady(() => base.get(key));
   const set: StateAdapter["set"] = (key, value, ttlMs) =>
     afterReady(() => base.set(key, value, ttlMs));
+  const setIfNotExists: StateAdapter["setIfNotExists"] = (key, value, ttlMs) =>
+    afterReady(() => base.setIfNotExists(key, value, ttlMs));
 
   return {
     acquireLock: vi.fn((threadId, ttlMs) =>
@@ -312,6 +324,7 @@ function makeStateAdapter(initial: Record<string, unknown> = {}): StateAdapter {
     isSubscribed: vi.fn((threadId) => afterReady(() => base.isSubscribed(threadId))),
     releaseLock: vi.fn((lock) => afterReady(() => base.releaseLock(lock))),
     set: vi.fn(set),
+    setIfNotExists: vi.fn(setIfNotExists),
     subscribe: vi.fn((threadId) => afterReady(() => base.subscribe(threadId))),
     unsubscribe: vi.fn((threadId) => afterReady(() => base.unsubscribe(threadId))),
   };
@@ -1304,7 +1317,134 @@ describe("MatrixAdapter", () => {
     const adapter = await makeInitializedAdapter(fakeClient);
 
     await adapter.shutdown();
+    expect(fakeClient.store.save).toHaveBeenCalledWith(true);
     expect(fakeClient.stopClient).toHaveBeenCalledOnce();
+  });
+
+  it("passes a chat-backed matrix store into custom client creation when enabled", async () => {
+    const fakeClient = makeClient();
+    const createStore = vi.fn(() => ({
+      save: vi.fn(async () => undefined),
+      startup: vi.fn(async () => undefined),
+      getSyncToken: vi.fn(() => null),
+      setSyncToken: vi.fn(),
+      storeRoom: vi.fn(),
+      setUserCreator: vi.fn(),
+      getRoom: vi.fn(() => null),
+      getRooms: vi.fn(() => []),
+      removeRoom: vi.fn(),
+      getRoomSummaries: vi.fn(() => []),
+      storeUser: vi.fn(),
+      getUser: vi.fn(() => null),
+      getUsers: vi.fn(() => []),
+      scrollback: vi.fn(() => []),
+      storeEvents: vi.fn(),
+      storeFilter: vi.fn(),
+      getFilter: vi.fn(() => null),
+      getFilterIdByName: vi.fn(() => null),
+      setFilterIdByName: vi.fn(),
+      storeAccountDataEvents: vi.fn(),
+      getAccountData: vi.fn(() => undefined),
+      setSyncData: vi.fn(async () => undefined),
+      wantsSave: vi.fn(() => false),
+      getSavedSync: vi.fn(async () => null),
+      getSavedSyncToken: vi.fn(async () => null),
+      deleteAllData: vi.fn(async () => undefined),
+      getOutOfBandMembers: vi.fn(async () => null),
+      setOutOfBandMembers: vi.fn(async () => undefined),
+      clearOutOfBandMembers: vi.fn(async () => undefined),
+      getClientOptions: vi.fn(async () => undefined),
+      storeClientOptions: vi.fn(async () => undefined),
+      getPendingEvents: vi.fn(async () => []),
+      setPendingEvents: vi.fn(async () => undefined),
+      saveToDeviceBatches: vi.fn(async () => undefined),
+      getOldestToDeviceBatch: vi.fn(async () => null),
+      removeToDeviceBatch: vi.fn(async () => undefined),
+      destroy: vi.fn(async () => undefined),
+      isNewlyCreated: vi.fn(async () => false),
+      accountData: new Map(),
+    }));
+    const createClient = vi.fn(() => asMatrixClient(fakeClient));
+    const state = makeStateAdapter();
+    const adapter = new MatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
+      matrixStore: { enabled: true },
+      createStore,
+      createClient,
+    });
+
+    await adapter.initialize(makeChatInstance({ state }));
+
+    expect(createStore).toHaveBeenCalledWith(
+      expect.objectContaining({
+        scopeKey: expect.stringMatching(
+          /^matrix:store:v1:https%3A%2F%2Fhs\.beeper\.com:%40bot%3Abeeper\.com:/
+        ),
+      })
+    );
+    expect(createClient).toHaveBeenCalledWith(
+      expect.objectContaining({
+        baseUrl: "https://hs.beeper.com",
+        store: createStore.mock.results[0]?.value,
+      })
+    );
+  });
+
+  it("imports and persists secrets bundles when enabled", async () => {
+    const fakeClient = makeClient();
+    fakeClient.__crypto.importSecretsBundle.mockResolvedValue(undefined);
+    const state = makeStateAdapter({
+      "matrix:store:v1:https%3A%2F%2Fhs.beeper.com:%40bot%3Abeeper.com:DEVICE1:secrets-bundle":
+        { bundle: "persisted" },
+    });
+    const adapter = new MatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
+      deviceID: "DEVICE1",
+      createClient: () => asMatrixClient(fakeClient),
+      matrixStore: { enabled: true },
+      e2ee: { enabled: true },
+    });
+
+    await adapter.initialize(makeChatInstance({ state }));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(fakeClient.__crypto.importSecretsBundle).toHaveBeenCalledWith({
+      bundle: "persisted",
+    });
+    expect(fakeClient.__crypto.exportSecretsBundle).toHaveBeenCalled();
+    expect(state.set).toHaveBeenCalledWith(
+      "matrix:store:v1:https%3A%2F%2Fhs.beeper.com:%40bot%3Abeeper.com:DEVICE1:secrets-bundle",
+      { bundle: "secret" }
+    );
+  });
+
+  it("does not fail initialization when secrets bundle import fails", async () => {
+    const fakeClient = makeClient();
+    fakeClient.__crypto.importSecretsBundle.mockRejectedValue(new Error("boom"));
+    const logger = makeTestLogger();
+    const state = makeStateAdapter({
+      "matrix:store:v1:https%3A%2F%2Fhs.beeper.com:%40bot%3Abeeper.com:DEVICE1:secrets-bundle":
+        { bundle: "persisted" },
+    });
+    const adapter = new MatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
+      deviceID: "DEVICE1",
+      createClient: () => asMatrixClient(fakeClient),
+      matrixStore: { enabled: true },
+      e2ee: { enabled: true },
+      logger: logger.logger,
+    });
+
+    await expect(adapter.initialize(makeChatInstance({ state }))).resolves.toBeUndefined();
+    await Promise.resolve();
+    expect(logger.warn).toHaveBeenCalledWith(
+      "Failed to import persisted Matrix secrets bundle",
+      expect.objectContaining({ error: expect.any(Error) })
+    );
   });
 
   it("persists and reloads matrix session via chat state", async () => {

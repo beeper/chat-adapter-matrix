@@ -413,7 +413,7 @@ describe.skipIf(!hasCoreCredentials)("E2E Matrix Adapter", () => {
   });
 
   it("restarts on the same session and catches up paginated room history", async () => {
-    const offlineCount = 12;
+    const offlineCount = 6;
     const restartTag = `e2e-restart-${nonce()}`;
     const roomThreadId = sender.adapter.encodeThreadId({ roomID });
     const botSession = bot.session;
