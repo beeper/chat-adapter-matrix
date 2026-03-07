@@ -2,6 +2,9 @@
   "name": "@beeper/chat-adapter-matrix",
   "version": "1.0.0",
   "description": "Matrix adapter for chat",
+  "engines": {
+    "node": ">=22"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
