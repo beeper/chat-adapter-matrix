@@ -151,7 +151,8 @@ function mapRawToEvent(raw: RawEventLike) {
 
 type AdapterInternals = {
   deviceID?: string;
-  e2eeConfig?: { enabled?: boolean };
+  e2eeConfig?: Record<string, unknown>;
+  e2eeEnabled?: boolean;
   getSecretStorageKeyFromRecoveryKey: (opts: {
     keys: Record<string, unknown>;
   }) => [string, Uint8Array] | null;
@@ -170,7 +171,7 @@ type AdapterInternals = {
     userID: string;
     deviceID?: string;
   }>;
-  resolveDeviceID: () => Promise<void>;
+  resolveDeviceID: (...candidates: Array<string | undefined>) => Promise<string>;
   stateAdapter: StateAdapter | null;
 };
 
@@ -523,7 +524,6 @@ describe("MatrixAdapter", () => {
         userID: "@bot:beeper.com",
       },
       inviteAutoJoin: {
-        enabled: true,
         inviterAllowlist: ["@alice:beeper.com"],
       },
       createClient: () => asMatrixClient(fakeClient),
@@ -571,7 +571,6 @@ describe("MatrixAdapter", () => {
         userID: "@bot:beeper.com",
       },
       inviteAutoJoin: {
-        enabled: true,
         inviterAllowlist: ["@alice:beeper.com"],
       },
       logger: logger.logger,
@@ -623,7 +622,6 @@ describe("MatrixAdapter", () => {
         userID: "@bot:beeper.com",
       },
       inviteAutoJoin: {
-        enabled: true,
         inviterAllowlist: ["@trusted:beeper.com"],
       },
       createClient: () => asMatrixClient(fakeClient),
@@ -774,7 +772,7 @@ describe("MatrixAdapter", () => {
       },
       deviceID: "DEVICE1",
       createClient: () => asMatrixClient(fakeClient),
-      e2ee: { enabled: true },
+      e2ee: {},
     });
 
     await adapter.initialize(makeChatInstance({ processMessage }));
@@ -809,7 +807,23 @@ describe("MatrixAdapter", () => {
       })
     );
 
-    expect(adapter.e2eeConfig?.enabled).toBe(true);
+    expect(adapter.e2eeEnabled).toBe(true);
+  });
+
+  it("enables e2ee when explicit e2ee config is provided", () => {
+    const adapter = getInternals(
+      createMatrixAdapter({
+        baseURL: "https://hs.beeper.com",
+        auth: {
+          type: "accessToken",
+          accessToken: "token",
+          userID: "@bot:beeper.com",
+        },
+        e2ee: {},
+      })
+    );
+
+    expect(adapter.e2eeEnabled).toBe(true);
   });
 
   it("decodes recovery key for secret storage callback", () => {
@@ -1330,7 +1344,7 @@ describe("MatrixAdapter", () => {
     expect(fakeClient.stopClient).toHaveBeenCalledOnce();
   });
 
-  it("passes a chat-backed matrix store into custom client creation when enabled", async () => {
+  it("passes a chat-backed matrix store into custom client creation when state is available", async () => {
     const fakeClient = makeClient();
     const createStore = vi.fn(() => ({
       save: vi.fn(async () => undefined),
@@ -1378,7 +1392,6 @@ describe("MatrixAdapter", () => {
     const adapter = new MatrixAdapter({
       baseURL: "https://hs.beeper.com",
       auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
-      matrixStore: { enabled: true },
       createStore,
       createClient,
     });
@@ -1388,7 +1401,7 @@ describe("MatrixAdapter", () => {
     expect(createStore).toHaveBeenCalledWith(
       expect.objectContaining({
         scopeKey: expect.stringMatching(
-          /^matrix:store:v1:https%3A%2F%2Fhs\.beeper\.com:%40bot%3Abeeper\.com:/
+          /^matrix:store:https%3A%2F%2Fhs\.beeper\.com:%40bot%3Abeeper\.com:/
         ),
       })
     );
@@ -1404,7 +1417,7 @@ describe("MatrixAdapter", () => {
     const fakeClient = makeClient();
     fakeClient.__crypto.importSecretsBundle.mockResolvedValue(undefined);
     const state = makeStateAdapter({
-      "matrix:store:v1:https%3A%2F%2Fhs.beeper.com:%40bot%3Abeeper.com:DEVICE1:secrets-bundle":
+      "matrix:store:https%3A%2F%2Fhs.beeper.com:%40bot%3Abeeper.com:DEVICE1:secrets-bundle":
         { bundle: "persisted" },
     });
     const adapter = new MatrixAdapter({
@@ -1412,8 +1425,7 @@ describe("MatrixAdapter", () => {
       auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
       deviceID: "DEVICE1",
       createClient: () => asMatrixClient(fakeClient),
-      matrixStore: { enabled: true },
-      e2ee: { enabled: true },
+      e2ee: {},
     });
 
     await adapter.initialize(makeChatInstance({ state }));
@@ -1425,7 +1437,7 @@ describe("MatrixAdapter", () => {
     });
     expect(fakeClient.__crypto.exportSecretsBundle).toHaveBeenCalled();
     expect(state.set).toHaveBeenCalledWith(
-      "matrix:store:v1:https%3A%2F%2Fhs.beeper.com:%40bot%3Abeeper.com:DEVICE1:secrets-bundle",
+      "matrix:store:https%3A%2F%2Fhs.beeper.com:%40bot%3Abeeper.com:DEVICE1:secrets-bundle",
       { bundle: "secret" }
     );
   });
@@ -1435,7 +1447,7 @@ describe("MatrixAdapter", () => {
     fakeClient.__crypto.importSecretsBundle.mockRejectedValue(new Error("boom"));
     const logger = makeTestLogger();
     const state = makeStateAdapter({
-      "matrix:store:v1:https%3A%2F%2Fhs.beeper.com:%40bot%3Abeeper.com:DEVICE1:secrets-bundle":
+      "matrix:store:https%3A%2F%2Fhs.beeper.com:%40bot%3Abeeper.com:DEVICE1:secrets-bundle":
         { bundle: "persisted" },
     });
     const adapter = new MatrixAdapter({
@@ -1443,8 +1455,7 @@ describe("MatrixAdapter", () => {
       auth: { type: "accessToken", accessToken: "token", userID: "@bot:beeper.com" },
       deviceID: "DEVICE1",
       createClient: () => asMatrixClient(fakeClient),
-      matrixStore: { enabled: true },
-      e2ee: { enabled: true },
+      e2ee: {},
       logger: logger.logger,
     });
 
@@ -1636,11 +1647,11 @@ describe("MatrixAdapter", () => {
     expect(resolved).toMatchObject({
       accessToken: "fresh-token",
       userID: "@bot:beeper.com",
-      deviceID: "DEVICE2",
+      deviceID: "DEVICE1",
     });
   });
 
-  it("uses whoami device_id for access token auth", async () => {
+  it("prefers an explicit deviceID over auth-derived device IDs", async () => {
     const whoami = vi.fn(async () => ({
       user_id: "@bot:beeper.com",
       device_id: "DEVICE_FROM_WHOAMI",
@@ -1669,7 +1680,73 @@ describe("MatrixAdapter", () => {
     expect(resolved).toMatchObject({
       accessToken: "token",
       userID: "@bot:beeper.com",
+      deviceID: "DEVICE_FALLBACK",
+    });
+  });
+
+  it("uses whoami device_id for access token auth when no explicit deviceID is provided", async () => {
+    const whoami = vi.fn(async () => ({
+      user_id: "@bot:beeper.com",
+      device_id: "DEVICE_FROM_WHOAMI",
+    }));
+
+    const adapter = new MatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: {
+        type: "accessToken",
+        accessToken: "token",
+        userID: "@bot:beeper.com",
+      },
+      createBootstrapClient: () =>
+        ({
+          whoami,
+          loginWithPassword: vi.fn(),
+        }),
+    });
+
+    const internals = getInternals(adapter);
+    internals.stateAdapter = makeStateAdapter();
+    const resolved = await internals.resolveAuth();
+
+    expect(whoami).toHaveBeenCalledOnce();
+    expect(resolved).toMatchObject({
+      accessToken: "token",
+      userID: "@bot:beeper.com",
       deviceID: "DEVICE_FROM_WHOAMI",
+    });
+  });
+
+  it("falls back to a persisted deviceID when auth does not return one", async () => {
+    const whoami = vi.fn(async () => ({
+      user_id: "@bot:beeper.com",
+    }));
+    const state = makeStateAdapter({
+      "matrix:device:https%3A%2F%2Fhs.beeper.com:%40bot%3Abeeper.com":
+        "DEVICE_FROM_STATE",
+    });
+
+    const adapter = new MatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: {
+        type: "accessToken",
+        accessToken: "token",
+        userID: "@bot:beeper.com",
+      },
+      createBootstrapClient: () =>
+        ({
+          whoami,
+          loginWithPassword: vi.fn(),
+        }),
+    });
+
+    const internals = getInternals(adapter);
+    internals.stateAdapter = state;
+    const resolved = await internals.resolveAuth();
+
+    expect(resolved).toMatchObject({
+      accessToken: "token",
+      userID: "@bot:beeper.com",
+      deviceID: "DEVICE_FROM_STATE",
     });
   });
 

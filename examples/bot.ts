@@ -10,7 +10,7 @@ const logger = new ConsoleLogger(
 const matrix = createMatrixAdapter();
 
 const bot = new Chat({
-  userName: process.env.BOT_USER_NAME ?? "beeper-bot",
+  userName: process.env.MATRIX_BOT_USERNAME ?? "beeper-bot",
   logger,
   state: createMemoryState(),
   adapters: {

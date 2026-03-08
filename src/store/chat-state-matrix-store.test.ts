@@ -62,7 +62,7 @@ async function makeStore(
 ) {
   const store = new ChatStateMatrixStore({
     state,
-    scopeKey: "matrix:store:v1:https%3A%2F%2Fhs.beeper.com:%40bot%3Abeeper.com:DEVICE1",
+    scopeKey: "matrix:store:https%3A%2F%2Fhs.beeper.com:%40bot%3Abeeper.com:DEVICE1",
     logger: makeLogger(),
     persistIntervalMs: 30_000,
     ...options,
@@ -83,7 +83,7 @@ describe("ChatStateMatrixStore", () => {
 
   it("loads persisted saved sync during startup", async () => {
     const scope =
-      "matrix:store:v1:https%3A%2F%2Fhs.beeper.com:%40bot%3Abeeper.com:DEVICE1";
+      "matrix:store:https%3A%2F%2Fhs.beeper.com:%40bot%3Abeeper.com:DEVICE1";
     const state = await makeState({
       [`${scope}:meta`]: {
         version: 1,
@@ -105,7 +105,7 @@ describe("ChatStateMatrixStore", () => {
 
   it("reads saved sync token from meta without loading the full snapshot", async () => {
     const scope =
-      "matrix:store:v1:https%3A%2F%2Fhs.beeper.com:%40bot%3Abeeper.com:DEVICE1";
+      "matrix:store:https%3A%2F%2Fhs.beeper.com:%40bot%3Abeeper.com:DEVICE1";
     const state = await makeState({
       [`${scope}:meta`]: {
         version: 1,
@@ -130,7 +130,7 @@ describe("ChatStateMatrixStore", () => {
 
   it("marks sync data dirty and only persists on a forced save before the interval", async () => {
     const scope =
-      "matrix:store:v1:https%3A%2F%2Fhs.beeper.com:%40bot%3Abeeper.com:DEVICE1";
+      "matrix:store:https%3A%2F%2Fhs.beeper.com:%40bot%3Abeeper.com:DEVICE1";
     const state = await makeState({
       [`${scope}:meta`]: {
         version: 1,
@@ -233,15 +233,15 @@ describe("ChatStateMatrixStore", () => {
 
     await store.deleteAllData();
 
-    expect(await state.get("matrix:store:v1:https%3A%2F%2Fhs.beeper.com:%40bot%3Abeeper.com:DEVICE1:meta")).toBeNull();
+    expect(await state.get("matrix:store:https%3A%2F%2Fhs.beeper.com:%40bot%3Abeeper.com:DEVICE1:meta")).toBeNull();
     expect(
       await state.get(
-        "matrix:store:v1:https%3A%2F%2Fhs.beeper.com:%40bot%3Abeeper.com:DEVICE1:saved-sync"
+        "matrix:store:https%3A%2F%2Fhs.beeper.com:%40bot%3Abeeper.com:DEVICE1:saved-sync"
       )
     ).toBeNull();
     expect(
       await state.get(
-        "matrix:store:v1:https%3A%2F%2Fhs.beeper.com:%40bot%3Abeeper.com:DEVICE1:pending-events:%21room%3Abeeper.com"
+        "matrix:store:https%3A%2F%2Fhs.beeper.com:%40bot%3Abeeper.com:DEVICE1:pending-events:%21room%3Abeeper.com"
       )
     ).toBeNull();
   });

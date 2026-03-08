@@ -69,13 +69,9 @@ export async function createParticipantFromSession(opts: {
       userID: opts.session.userID,
     },
     deviceID: opts.session.deviceID,
-    inviteAutoJoin: { enabled: true },
+    inviteAutoJoin: {},
     e2ee: {
-      enabled: true,
       useIndexedDB: false,
-    },
-    matrixStore: {
-      enabled: true,
     },
     recoveryKey: opts.recoveryKey,
   });

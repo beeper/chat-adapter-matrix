@@ -69,17 +69,15 @@ import type {
   MatrixAdapterConfig,
   MatrixAuthConfig,
   MatrixCreateStoreOptions,
-  MatrixSyncStoreConfig,
+  MatrixPersistenceConfig,
+  MatrixPersistenceSyncConfig,
   MatrixThreadID,
 } from "./types";
 
 const MATRIX_PREFIX = "matrix";
-const MATRIX_DEVICE_PREFIX = "matrix:device";
-const MATRIX_DM_PREFIX = "matrix:dm";
-const MATRIX_SESSION_PREFIX = "matrix:session";
-const MATRIX_STORE_PREFIX = "matrix:store:v1";
 const MATRIX_CURSOR_PREFIX = "mxv1:";
 const DEFAULT_COMMAND_PREFIX = "/";
+const DEFAULT_PERSISTENCE_KEY_PREFIX = "matrix";
 const TYPING_TIMEOUT_MS = 30_000;
 const DEFAULT_MATRIX_STORE_PERSIST_INTERVAL_MS = 30_000;
 const FAST_SYNC_DEFAULTS: NonNullable<MatrixAdapterConfig["sync"]> = {
@@ -138,11 +136,11 @@ type ResolvedAuth = {
   userID: string;
 };
 
-type ResolvedMatrixStoreConfig = {
-  enabled: boolean;
+type ResolvedPersistenceConfig = {
   keyPrefix: string;
-  persistIntervalMs: number;
-  snapshotTtlMs?: number;
+  session: Pick<NonNullable<MatrixPersistenceConfig["session"]>, "decrypt" | "encrypt" | "ttlMs">;
+  sync: Required<Pick<NonNullable<MatrixPersistenceSyncConfig>, "persistIntervalMs">> &
+    Pick<NonNullable<MatrixPersistenceSyncConfig>, "snapshotTtlMs">;
 };
 
 type StoredSession = {
@@ -157,11 +155,6 @@ type StoredSession = {
   updatedAt: string;
   userID: string;
   username?: string;
-};
-
-type DeviceIDPersistenceConfig = {
-  enabled: boolean;
-  key?: string;
 };
 
 type CursorKind = "room_messages" | "thread_relations" | "thread_list";
@@ -240,18 +233,11 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   private readonly createStoreFn?: MatrixAdapterConfig["createStore"];
   private readonly createBootstrapClientFn?: MatrixAdapterConfig["createBootstrapClient"];
   private readonly e2eeConfig?: MatrixAdapterConfig["e2ee"];
-  private readonly matrixStoreConfig: ResolvedMatrixStoreConfig;
+  private readonly e2eeEnabled: boolean;
+  private readonly persistenceConfig: ResolvedPersistenceConfig;
   private readonly recoveryKey?: string;
   private readonly matrixSDKLogLevel?: MatrixAdapterConfig["matrixSDKLogLevel"];
-  private readonly deviceIDPersistence: DeviceIDPersistenceConfig;
   private readonly loggerProvided: boolean;
-  private readonly sessionConfig: Required<
-    Pick<NonNullable<MatrixAdapterConfig["session"]>, "enabled">
-  > &
-    Pick<
-      NonNullable<MatrixAdapterConfig["session"]>,
-      "decrypt" | "encrypt" | "key" | "ttlMs"
-    >;
 
   private logger: Logger;
   private chat: ChatInstance | null = null;
@@ -283,8 +269,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     const inviteAutoJoinInviterAllowlist = normalizeStringList(
       config.inviteAutoJoin?.inviterAllowlist
     );
-    this.inviteAutoJoinEnabled =
-      config.inviteAutoJoin?.enabled ?? Boolean(config.inviteAutoJoin);
+    this.inviteAutoJoinEnabled = Boolean(config.inviteAutoJoin);
     this.inviteAutoJoinInviterAllowlist =
       inviteAutoJoinInviterAllowlist.length > 0
         ? new Set(inviteAutoJoinInviterAllowlist)
@@ -293,36 +278,15 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     this.createClientFn = config.createClient;
     this.createStoreFn = config.createStore;
     this.createBootstrapClientFn = config.createBootstrapClient;
+    this.e2eeEnabled = Boolean(config.recoveryKey || config.e2ee);
     this.e2eeConfig = {
       ...config.e2ee,
-      enabled: config.e2ee?.enabled ?? Boolean(config.recoveryKey),
-      persistSecretsBundle:
-        config.e2ee?.persistSecretsBundle ??
-        Boolean(config.matrixStore?.enabled && (config.e2ee?.enabled ?? Boolean(config.recoveryKey))),
       storagePassword:
         config.e2ee?.storagePassword ?? config.recoveryKey,
     };
-    this.matrixStoreConfig = {
-      enabled: config.matrixStore?.enabled ?? false,
-      keyPrefix: normalizeOptionalString(config.matrixStore?.keyPrefix) ?? MATRIX_STORE_PREFIX,
-      persistIntervalMs:
-        config.matrixStore?.persistIntervalMs ??
-        DEFAULT_MATRIX_STORE_PERSIST_INTERVAL_MS,
-      snapshotTtlMs: config.matrixStore?.snapshotTtlMs,
-    };
+    this.persistenceConfig = normalizePersistenceConfig(config.persistence);
     this.recoveryKey = normalizeOptionalString(config.recoveryKey);
     this.matrixSDKLogLevel = config.matrixSDKLogLevel;
-    this.deviceIDPersistence = {
-      enabled: config.deviceIDPersistence?.enabled ?? true,
-      key: normalizeOptionalString(config.deviceIDPersistence?.key),
-    };
-    this.sessionConfig = {
-      decrypt: config.session?.decrypt,
-      enabled: config.session?.enabled ?? true,
-      encrypt: config.session?.encrypt,
-      key: config.session?.key,
-      ttlMs: config.session?.ttlMs,
-    };
     this.loggerProvided = Boolean(config.logger);
     this.logger = config.logger ?? new ConsoleLogger("info").child("matrix");
   }
@@ -338,14 +302,12 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     }
     this.stateAdapter = chat.getState();
     this.configureMatrixSDKLogging();
-    await this.resolveDeviceID();
 
     let resolvedAuth: ResolvedAuth | null = null;
     if (this.createClientFn) {
+      await this.resolveDeviceID();
       const store = await this.maybeCreateMatrixStore();
-      if (this.persistSecretsBundleEnabled) {
-        this.matrixStoreScopeKey = this.resolveMatrixStoreContext()?.scopeKey ?? null;
-      }
+      this.matrixStoreScopeKey = this.resolveMatrixStoreContext()?.scopeKey ?? null;
       const clientOptions = this.buildCustomClientOptions(store);
       this.client = this.createClientFn(clientOptions);
     } else {
@@ -353,10 +315,8 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       this.userID = resolvedAuth.userID;
       this.deviceID = normalizeOptionalString(resolvedAuth.deviceID) ?? this.deviceID;
       const store = await this.maybeCreateMatrixStore(resolvedAuth);
-      if (!store && this.persistSecretsBundleEnabled) {
-        this.matrixStoreScopeKey =
-          this.resolveMatrixStoreContext(resolvedAuth)?.scopeKey ?? null;
-      }
+      this.matrixStoreScopeKey =
+        this.resolveMatrixStoreContext(resolvedAuth)?.scopeKey ?? null;
       this.client = this.buildClient(resolvedAuth, store);
     }
 
@@ -1117,7 +1077,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   }
 
   private getDMStorageKey(userID: string): string {
-    return `${MATRIX_DM_PREFIX}:${encodeURIComponent(userID)}`;
+    return `${this.persistenceConfig.keyPrefix}:dm:${encodeURIComponent(userID)}`;
   }
 
   private async loadPersistedDMRoomID(userID: string): Promise<string | null> {
@@ -1270,10 +1230,11 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     if (this.auth.type === "accessToken") {
       const whoami = await this.lookupWhoAmIFromAccessToken(this.auth.accessToken);
       const userID = this.auth.userID ?? whoami.userID;
+      const deviceID = await this.resolveDeviceID(whoami.deviceID);
       const resolved: ResolvedAuth = {
         accessToken: this.auth.accessToken,
         userID,
-        deviceID: whoami.deviceID ?? this.deviceID,
+        deviceID,
       };
       await Promise.all([
         this.persistDeviceIDForResolvedUser(userID, resolved.deviceID),
@@ -1286,10 +1247,14 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     if (restored?.accessToken) {
       try {
         const whoami = await this.lookupWhoAmIFromAccessToken(restored.accessToken);
+        const deviceID = await this.resolveDeviceID(
+          whoami.deviceID,
+          restored.deviceID
+        );
         const resolved: ResolvedAuth = {
           accessToken: restored.accessToken,
           userID: whoami.userID,
-          deviceID: this.deviceID ?? whoami.deviceID ?? restored.deviceID,
+          deviceID,
         };
         await Promise.all([
           this.persistDeviceIDForResolvedUser(resolved.userID, resolved.deviceID),
@@ -1325,15 +1290,23 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
           this.auth.password
         );
 
-    const userID = this.auth.userID ?? loginResponse.user_id;
+    let userID = this.auth.userID ?? loginResponse.user_id;
     if (!userID) {
       throw new Error("Password login succeeded but no user ID was returned.");
     }
 
+    let authDeviceID = normalizeOptionalString(loginResponse.device_id);
+    if (!authDeviceID) {
+      const whoami = await this.lookupWhoAmIFromAccessToken(loginResponse.access_token);
+      userID = userID ?? whoami.userID;
+      authDeviceID = whoami.deviceID;
+    }
+
+    const deviceID = await this.resolveDeviceID(authDeviceID);
     const resolved: ResolvedAuth = {
       accessToken: loginResponse.access_token,
       userID,
-      deviceID: loginResponse.device_id ?? this.deviceID ?? undefined,
+      deviceID,
     };
     await Promise.all([
       this.persistDeviceIDForResolvedUser(resolved.userID, resolved.deviceID),
@@ -1363,7 +1336,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
 
   private buildClient(auth: ResolvedAuth, store?: IStore): MatrixClient {
     const cryptoCallbacks =
-      this.recoveryKey && this.e2eeConfig?.enabled
+      this.recoveryKey && this.e2eeEnabled
         ? {
             getSecretStorageKey: async (
               opts: { keys: Record<string, unknown> },
@@ -1427,7 +1400,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   }
 
   private async maybeCreateMatrixStore(resolvedAuth?: ResolvedAuth): Promise<IStore | undefined> {
-    if (!this.stateAdapter || !this.matrixStoreConfig.enabled) {
+    if (!this.stateAdapter) {
       return undefined;
     }
 
@@ -1441,7 +1414,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
 
     const createStoreOptions: MatrixCreateStoreOptions = {
       baseURL: this.baseURL,
-      config: { ...this.matrixStoreConfig },
+      config: { ...this.persistenceConfig.sync },
       deviceID,
       logger: this.logger,
       scopeKey,
@@ -1457,8 +1430,8 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       state: this.stateAdapter,
       scopeKey,
       logger: this.logger,
-      persistIntervalMs: this.matrixStoreConfig.persistIntervalMs,
-      snapshotTtlMs: this.matrixStoreConfig.snapshotTtlMs,
+      persistIntervalMs: this.persistenceConfig.sync.persistIntervalMs,
+      snapshotTtlMs: this.persistenceConfig.sync.snapshotTtlMs,
     });
   }
 
@@ -1470,7 +1443,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       normalizeOptionalString(this.userID);
     if (!userID) {
       this.logger.warn(
-        "Matrix sync store is enabled, but no user ID is available for store scoping. Continuing without persistent sync store."
+        "No user ID is available for Matrix persistence scoping. Continuing without persistent sync store."
       );
       return null;
     }
@@ -1484,8 +1457,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   }
 
   private buildMatrixStoreScopeKey(userID: string, deviceID?: string): string {
-    const keyPrefix = this.matrixStoreConfig.keyPrefix;
-    return `${keyPrefix}:${encodeURIComponent(this.baseURL)}:${encodeURIComponent(userID)}:${encodeURIComponent(deviceID ?? "default")}`;
+    return `${this.persistenceStorePrefix}:${encodeURIComponent(this.baseURL)}:${encodeURIComponent(userID)}:${encodeURIComponent(deviceID ?? "default")}`;
   }
 
   private async maybeFlushMatrixStore(): Promise<void> {
@@ -1599,7 +1571,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   }
 
   private async maybeInitE2EE(): Promise<void> {
-    if (!this.e2eeConfig?.enabled) {
+    if (!this.e2eeEnabled) {
       return;
     }
 
@@ -1609,7 +1581,8 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       );
     }
 
-    const requestedIndexedDB = this.e2eeConfig.useIndexedDB;
+    const e2eeConfig = this.e2eeConfig ?? {};
+    const requestedIndexedDB = e2eeConfig.useIndexedDB;
     const useIndexedDB =
       requestedIndexedDB === true && !hasIndexedDB()
         ? false
@@ -1623,9 +1596,9 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
 
     await this.requireClient().initRustCrypto({
       useIndexedDB,
-      cryptoDatabasePrefix: this.e2eeConfig.cryptoDatabasePrefix,
-      storagePassword: this.e2eeConfig.storagePassword,
-      storageKey: this.e2eeConfig.storageKey,
+      cryptoDatabasePrefix: e2eeConfig.cryptoDatabasePrefix,
+      storagePassword: e2eeConfig.storagePassword,
+      storageKey: e2eeConfig.storageKey,
     });
     await this.maybeImportPersistedSecretsBundle();
     void this.maybeLoadKeyBackupFromRecoveryKey();
@@ -1633,7 +1606,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
 
     this.logger.info("Matrix E2EE initialized", {
       useIndexedDB: useIndexedDB !== false,
-      cryptoDatabasePrefix: this.e2eeConfig.cryptoDatabasePrefix,
+      cryptoDatabasePrefix: e2eeConfig.cryptoDatabasePrefix,
     });
   }
 
@@ -1660,7 +1633,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   }
 
   private get persistSecretsBundleEnabled(): boolean {
-    return Boolean(this.e2eeConfig?.enabled && this.e2eeConfig?.persistSecretsBundle);
+    return Boolean(this.e2eeEnabled && this.stateAdapter);
   }
 
   private getSecretsBundleStorageKey(): string | null {
@@ -1749,7 +1722,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   }
 
   private async tryDecryptEvent(event: MatrixEvent): Promise<void> {
-    if (!this.e2eeConfig?.enabled) {
+    if (!this.e2eeEnabled) {
       return;
     }
 
@@ -3088,27 +3061,31 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     return `${threadId}::${messageId}::${rawEmoji}`;
   }
 
+  private get persistenceSessionPrefix(): string {
+    return `${this.persistenceConfig.keyPrefix}:session:${encodeURIComponent(this.baseURL)}`;
+  }
+
+  private get persistenceStorePrefix(): string {
+    return `${this.persistenceConfig.keyPrefix}:store`;
+  }
+
   private get sessionBasePrefix(): string {
-    return `${MATRIX_SESSION_PREFIX}:${encodeURIComponent(this.baseURL)}`;
+    return this.persistenceSessionPrefix;
   }
 
   private getSessionStorageKey(userID: string): string {
-    if (this.sessionConfig.key) {
-      return this.sessionConfig.key;
-    }
-
     return `${this.sessionBasePrefix}:user:${encodeURIComponent(userID)}`;
   }
 
   private getSessionUsernameTemporaryKey(): string | null {
-    if (this.sessionConfig.key || this.auth.type !== "password") {
+    if (this.auth.type !== "password") {
       return null;
     }
     return `${this.sessionBasePrefix}:username:${encodeURIComponent(this.auth.username)}`;
   }
 
   private async loadPersistedSession(): Promise<StoredSession | null> {
-    if (!this.sessionConfig.enabled || !this.stateAdapter) {
+    if (!this.stateAdapter) {
       return null;
     }
 
@@ -3135,7 +3112,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   }
 
   private async persistSession(auth: ResolvedAuth, existingCreatedAt?: string): Promise<void> {
-    if (!this.sessionConfig.enabled || !this.stateAdapter) {
+    if (!this.stateAdapter) {
       return;
     }
 
@@ -3146,7 +3123,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       baseURL: this.baseURL,
       createdAt: existingCreatedAt ?? now,
       deviceID: auth.deviceID,
-      e2eeEnabled: Boolean(this.e2eeConfig?.enabled),
+      e2eeEnabled: this.e2eeEnabled,
       recoveryKeyPresent: Boolean(this.e2eeConfig?.storagePassword),
       updatedAt: now,
       userID: auth.userID,
@@ -3158,21 +3135,26 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     await this.stateAdapter.set(
       sessionKey,
       encodedSession,
-      this.sessionConfig.ttlMs
+      this.persistenceConfig.session.ttlMs
     );
 
     const temporaryKey = this.getSessionUsernameTemporaryKey();
     if (temporaryKey && temporaryKey !== sessionKey) {
-      await this.stateAdapter.set(temporaryKey, encodedSession, this.sessionConfig.ttlMs);
+      await this.stateAdapter.set(
+        temporaryKey,
+        encodedSession,
+        this.persistenceConfig.session.ttlMs
+      );
     }
   }
 
   private encodeStoredSession(session: StoredSession): StoredSession {
-    if (!this.sessionConfig.encrypt) {
+    if (!this.persistenceConfig.session.encrypt) {
       return session;
     }
 
-    const encryptedPayload = this.sessionConfig.encrypt(JSON.stringify(session));
+    const encryptedPayload =
+      this.persistenceConfig.session.encrypt(JSON.stringify(session));
     const { accessToken, ...metadata } = session;
     return { ...metadata, encryptedPayload };
   }
@@ -3184,12 +3166,13 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       return session;
     }
 
-    if (!this.sessionConfig.decrypt) {
+    if (!this.persistenceConfig.session.decrypt) {
       return null;
     }
 
     try {
-      const decryptedJSON = this.sessionConfig.decrypt(session.encryptedPayload);
+      const decryptedJSON =
+        this.persistenceConfig.session.decrypt(session.encryptedPayload);
       const parsed: unknown = JSON.parse(decryptedJSON);
       if (!this.isValidStoredSession(parsed)) {
         return null;
@@ -3242,53 +3225,62 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     if (!config.baseURL?.trim()) {
       throw new Error("baseURL is required.");
     }
-    if (config.session?.ttlMs !== undefined && config.session.ttlMs <= 0) {
-      throw new Error("session.ttlMs must be a positive number.");
+    if (config.persistence?.session?.ttlMs !== undefined && config.persistence.session.ttlMs <= 0) {
+      throw new Error("persistence.session.ttlMs must be a positive number.");
     }
     if (
-      config.matrixStore?.persistIntervalMs !== undefined &&
-      config.matrixStore.persistIntervalMs <= 0
+      config.persistence?.sync?.persistIntervalMs !== undefined &&
+      config.persistence.sync.persistIntervalMs <= 0
     ) {
-      throw new Error("matrixStore.persistIntervalMs must be a positive number.");
+      throw new Error("persistence.sync.persistIntervalMs must be a positive number.");
     }
     if (
-      config.matrixStore?.snapshotTtlMs !== undefined &&
-      config.matrixStore.snapshotTtlMs <= 0
+      config.persistence?.sync?.snapshotTtlMs !== undefined &&
+      config.persistence.sync.snapshotTtlMs <= 0
     ) {
-      throw new Error("matrixStore.snapshotTtlMs must be a positive number.");
+      throw new Error("persistence.sync.snapshotTtlMs must be a positive number.");
     }
     if (
-      (config.session?.encrypt && !config.session?.decrypt) ||
-      (!config.session?.encrypt && config.session?.decrypt)
+      (config.persistence?.session?.encrypt && !config.persistence?.session?.decrypt) ||
+      (!config.persistence?.session?.encrypt && config.persistence?.session?.decrypt)
     ) {
       throw new Error(
-        "session.encrypt and session.decrypt must be provided together."
+        "persistence.session.encrypt and persistence.session.decrypt must be provided together."
       );
     }
   }
 
-  private async resolveDeviceID(): Promise<void> {
-    if (this.deviceID) {
-      return;
+  private async resolveDeviceID(...candidates: Array<string | undefined>): Promise<string> {
+    const configuredDeviceID = normalizeOptionalString(this.deviceID);
+    if (configuredDeviceID) {
+      this.deviceID = configuredDeviceID;
+      return configuredDeviceID;
+    }
+
+    for (const candidate of candidates) {
+      const normalized = normalizeOptionalString(candidate);
+      if (normalized) {
+        this.deviceID = normalized;
+        await this.persistDeviceID(normalized);
+        return normalized;
+      }
     }
 
     const persisted = await this.loadPersistedDeviceID();
     if (persisted) {
       this.deviceID = persisted;
-      return;
+      return persisted;
     }
 
     const generated = generateDeviceID();
     this.deviceID = generated;
     await this.persistDeviceID(generated);
+    return generated;
   }
 
   private getDeviceIDStorageKey(identityHint?: string): string {
-    if (this.deviceIDPersistence.key) {
-      return this.deviceIDPersistence.key;
-    }
-
-    const basePrefix = `${MATRIX_DEVICE_PREFIX}:${encodeURIComponent(this.baseURL)}`;
+    const basePrefix =
+      `${this.persistenceConfig.keyPrefix}:device:${encodeURIComponent(this.baseURL)}`;
     const hint =
       identityHint ??
       this.auth.userID ??
@@ -3297,7 +3289,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   }
 
   private async loadPersistedDeviceID(): Promise<string | null> {
-    if (!this.deviceIDPersistence.enabled || !this.stateAdapter) {
+    if (!this.stateAdapter) {
       return null;
     }
 
@@ -3321,7 +3313,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   }
 
   private async persistDeviceID(deviceID: string, identityHint?: string): Promise<void> {
-    if (!this.deviceIDPersistence.enabled || !this.stateAdapter) {
+    if (!this.stateAdapter) {
       return;
     }
 
@@ -3342,12 +3334,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
 
     const temporaryKey = this.getDeviceIDStorageKey();
     const canonicalKey = this.getDeviceIDStorageKey(userID);
-    if (
-      this.deviceIDPersistence.enabled &&
-      this.stateAdapter &&
-      !this.deviceIDPersistence.key &&
-      temporaryKey !== canonicalKey
-    ) {
+    if (this.stateAdapter && temporaryKey !== canonicalKey) {
       await this.stateAdapter.delete(temporaryKey);
     }
   }
@@ -3392,13 +3379,11 @@ export function createMatrixAdapter(config?: MatrixAdapterConfig): MatrixAdapter
   }
 
   const recoveryKey = process.env.MATRIX_RECOVERY_KEY;
-  const e2eeEnabled =
-    Boolean(recoveryKey) || envBool(process.env.MATRIX_E2EE_ENABLED);
   const inviteAutoJoinInviterAllowlist = parseEnvList(
     process.env.MATRIX_INVITE_AUTOJOIN_ALLOWLIST
   );
   const inviteAutoJoinEnabled = envBool(
-    process.env.MATRIX_INVITE_AUTOJOIN_ENABLED,
+    process.env.MATRIX_INVITE_AUTOJOIN,
     inviteAutoJoinInviterAllowlist.length > 0
   );
 
@@ -3407,39 +3392,15 @@ export function createMatrixAdapter(config?: MatrixAdapterConfig): MatrixAdapter
   return new MatrixAdapter({
     baseURL,
     auth,
-    userName:
-      process.env.MATRIX_BOT_USERNAME ??
-      process.env.MOM_BOT_USERNAME ??
-      "bot",
+    userName: process.env.MATRIX_BOT_USERNAME ?? "bot",
     deviceID: normalizeOptionalString(process.env.MATRIX_DEVICE_ID),
-    deviceIDPersistence: {
-      enabled: envBool(process.env.MATRIX_DEVICE_ID_PERSIST_ENABLED, true),
-      key: normalizeOptionalString(process.env.MATRIX_DEVICE_ID_PERSIST_KEY),
-    },
     commandPrefix: process.env.MATRIX_COMMAND_PREFIX,
     recoveryKey,
-    inviteAutoJoin: {
-      enabled: inviteAutoJoinEnabled,
-      inviterAllowlist: inviteAutoJoinInviterAllowlist,
-    },
-    e2ee: {
-      enabled: e2eeEnabled,
-      useIndexedDB: envBool(
-        process.env.MATRIX_E2EE_USE_INDEXEDDB,
-        hasIndexedDB()
-      ),
-      cryptoDatabasePrefix: process.env.MATRIX_E2EE_DB_PREFIX,
-      storagePassword: process.env.MATRIX_E2EE_STORAGE_PASSWORD ?? recoveryKey,
-      storageKey: decodeBase64(
-        process.env.MATRIX_E2EE_STORAGE_KEY_BASE64,
-        "MATRIX_E2EE_STORAGE_KEY_BASE64"
-      ),
-    },
-    session: {
-      enabled: envBool(process.env.MATRIX_SESSION_ENABLED, true),
-      key: process.env.MATRIX_SESSION_KEY,
-      ttlMs: parseEnvNumber(process.env.MATRIX_SESSION_TTL_MS),
-    },
+    inviteAutoJoin: inviteAutoJoinEnabled
+      ? {
+          inviterAllowlist: inviteAutoJoinInviterAllowlist,
+        }
+      : undefined,
     matrixSDKLogLevel:
       parseSDKLogLevel(process.env.MATRIX_SDK_LOG_LEVEL) ?? "error",
   });
@@ -3448,9 +3409,30 @@ export function createMatrixAdapter(config?: MatrixAdapterConfig): MatrixAdapter
 export type {
   MatrixAdapterConfig,
   MatrixCreateStoreOptions,
-  MatrixSyncStoreConfig,
+  MatrixPersistenceConfig,
+  MatrixPersistenceSyncConfig,
   MatrixThreadID,
 } from "./types";
+
+function normalizePersistenceConfig(
+  config?: MatrixPersistenceConfig
+): ResolvedPersistenceConfig {
+  return {
+    keyPrefix:
+      normalizeOptionalString(config?.keyPrefix) ?? DEFAULT_PERSISTENCE_KEY_PREFIX,
+    session: {
+      decrypt: config?.session?.decrypt,
+      encrypt: config?.session?.encrypt,
+      ttlMs: config?.session?.ttlMs,
+    },
+    sync: {
+      persistIntervalMs:
+        config?.sync?.persistIntervalMs ??
+        DEFAULT_MATRIX_STORE_PERSIST_INTERVAL_MS,
+      snapshotTtlMs: config?.sync?.snapshotTtlMs,
+    },
+  };
+}
 
 function resolveAuthFromEnv(): MatrixAuthConfig {
   const username = process.env.MATRIX_USERNAME;
@@ -3495,35 +3477,6 @@ function envBool(value: string | undefined, fallback = false): boolean {
     normalized === "yes" ||
     normalized === "on"
   );
-}
-
-function decodeBase64(
-  value: string | undefined,
-  envName: string
-): Uint8Array | undefined {
-  if (!value) {
-    return undefined;
-  }
-
-  const bytes = Buffer.from(value, "base64");
-  if (bytes.length === 0) {
-    throw new Error(`${envName} is set but could not be decoded as base64.`);
-  }
-
-  return bytes;
-}
-
-function parseEnvNumber(value: string | undefined): number | undefined {
-  if (!value) {
-    return undefined;
-  }
-
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed) || parsed <= 0) {
-    throw new Error(`Expected a positive number, got: ${value}`);
-  }
-
-  return parsed;
 }
 
 function parseEnvList(value: string | undefined): string[] {
