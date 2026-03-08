@@ -198,7 +198,35 @@ export async function getOrCreateRoom(
     return env.roomID;
   }
 
+  return createEncryptedRoom(botClient, senderUserID);
+}
+
+export async function createIsolatedRoom(
+  botClient: MatrixClient,
+  senderClient: MatrixClient,
+  senderUserID: string,
+  roomName = `matrix-chat-adapter-e2e-${nonce()}`,
+  timeoutMs = 30_000
+): Promise<string> {
+  const roomID = await createEncryptedRoom(botClient, senderUserID, roomName);
+
+  await Promise.all([
+    waitForEncryptedRoom(botClient, roomID, timeoutMs),
+    waitForEncryptedRoom(senderClient, roomID, timeoutMs),
+    waitForJoinedMemberCount(botClient, roomID, 2, timeoutMs),
+    waitForJoinedMemberCount(senderClient, roomID, 2, timeoutMs),
+  ]);
+
+  return roomID;
+}
+
+async function createEncryptedRoom(
+  botClient: MatrixClient,
+  senderUserID: string,
+  roomName?: string
+): Promise<string> {
   const { room_id } = await botClient.createRoom({
+    name: roomName,
     preset: "private_chat",
     invite: [senderUserID],
     initial_state: [
@@ -210,8 +238,9 @@ export async function getOrCreateRoom(
     ],
   });
 
-  // sender auto-joins via inviteAutoJoin; give sync time to propagate
-  await sleep(2_000);
+  if (typeof room_id !== "string" || room_id.length === 0) {
+    throw new Error("Matrix createRoom did not return room_id");
+  }
 
   return room_id;
 }

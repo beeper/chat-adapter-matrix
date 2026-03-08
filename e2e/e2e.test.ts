@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { stringifyMarkdown, type Message } from "chat";
 import { EventType, RoomEvent, RoomMemberEvent, type MatrixEvent } from "matrix-js-sdk";
 import {
+  createIsolatedRoom,
   createParticipant,
   createParticipantFromSession,
   env,
@@ -372,11 +373,18 @@ describe.skipIf(!hasCoreCredentials)("E2E Matrix Adapter", () => {
 
   it("fetchMessages pagination", async () => {
     const tag = `e2e-page-${nonce()}`;
-    const threadId = bot.adapter.encodeThreadId({ roomID });
+    const paginationRoomID = await createIsolatedRoom(
+      bot.matrixClient,
+      sender.matrixClient,
+      sender.userID,
+      `pagination-${tag}`,
+      45_000
+    );
+    const threadId = bot.adapter.encodeThreadId({ roomID: paginationRoomID });
     const count = 5;
 
     // Sender sends N messages
-    const senderThreadId = sender.adapter.encodeThreadId({ roomID });
+    const senderThreadId = sender.adapter.encodeThreadId({ roomID: paginationRoomID });
     for (let i = 0; i < count; i++) {
       await sender.adapter.postMessage(senderThreadId, `${tag} msg-${i}`);
       await sleep(200);
@@ -415,7 +423,14 @@ describe.skipIf(!hasCoreCredentials)("E2E Matrix Adapter", () => {
   it("restarts on the same session and catches up paginated room history", async () => {
     const offlineCount = 6;
     const restartTag = `e2e-restart-${nonce()}`;
-    const roomThreadId = sender.adapter.encodeThreadId({ roomID });
+    const restartRoomID = await createIsolatedRoom(
+      bot.matrixClient,
+      sender.matrixClient,
+      sender.userID,
+      `restart-${restartTag}`,
+      45_000
+    );
+    const roomThreadId = sender.adapter.encodeThreadId({ roomID: restartRoomID });
     const botSession = bot.session;
     const botState = bot.state;
 
@@ -425,7 +440,7 @@ describe.skipIf(!hasCoreCredentials)("E2E Matrix Adapter", () => {
     );
     await waitForFetchedMessage(
       bot.adapter,
-      bot.adapter.encodeThreadId({ roomID }),
+      bot.adapter.encodeThreadId({ roomID: restartRoomID }),
       baseline.id,
       (message) => message.text.includes(restartTag)
     );
@@ -450,14 +465,14 @@ describe.skipIf(!hasCoreCredentials)("E2E Matrix Adapter", () => {
     });
 
     await Promise.all([
-      waitForEncryptedRoom(bot.matrixClient, roomID, 45_000),
-      waitForJoinedMemberCount(bot.matrixClient, roomID, 2, 45_000),
+      waitForEncryptedRoom(bot.matrixClient, restartRoomID, 45_000),
+      waitForJoinedMemberCount(bot.matrixClient, restartRoomID, 2, 45_000),
     ]);
 
     const latestOffline = offlinePosts[offlinePosts.length - 1];
     const caughtUpMessage = await waitForFetchedMessage(
       bot.adapter,
-      bot.adapter.encodeThreadId({ roomID }),
+      bot.adapter.encodeThreadId({ roomID: restartRoomID }),
       latestOffline.id,
       (message) => message.text.includes(restartTag),
       60_000
@@ -468,7 +483,7 @@ describe.skipIf(!hasCoreCredentials)("E2E Matrix Adapter", () => {
     const botSawLiveMessage = waitForEvent<Message<MatrixEvent>>((cb) => {
       bot.onMessage((incomingThreadId, message) => {
         if (
-          incomingThreadId === bot.adapter.encodeThreadId({ roomID }) &&
+          incomingThreadId === bot.adapter.encodeThreadId({ roomID: restartRoomID }) &&
           message.text.includes(liveTag)
         ) {
           cb(message);
@@ -487,11 +502,14 @@ describe.skipIf(!hasCoreCredentials)("E2E Matrix Adapter", () => {
     let cursor: string | undefined;
 
     while (true) {
-      const page = await bot.adapter.fetchMessages(bot.adapter.encodeThreadId({ roomID }), {
-        direction: "backward",
-        limit: 5,
-        cursor,
-      });
+      const page = await bot.adapter.fetchMessages(
+        bot.adapter.encodeThreadId({ roomID: restartRoomID }),
+        {
+          direction: "backward",
+          limit: 5,
+          cursor,
+        }
+      );
       for (const message of page.messages) {
         fetchedIds.add(message.id);
       }
@@ -580,34 +598,43 @@ describe.skipIf(!hasCoreCredentials)("E2E Matrix Adapter", () => {
   it("fetches channel info, channel messages, thread info, and thread lists", async () => {
     const rootTag = `e2e-thread-list-root-${nonce()}`;
     const replyTag = `e2e-thread-list-reply-${nonce()}`;
-    const channelId = bot.adapter.channelIdFromThreadId(bot.adapter.encodeThreadId({ roomID }));
+    const threadListRoomID = await createIsolatedRoom(
+      bot.matrixClient,
+      sender.matrixClient,
+      sender.userID,
+      `thread-list-${rootTag}`,
+      45_000
+    );
+    const channelId = bot.adapter.channelIdFromThreadId(
+      bot.adapter.encodeThreadId({ roomID: threadListRoomID })
+    );
 
     const roomInfo = await bot.adapter.fetchChannelInfo(channelId);
     expect(roomInfo.id).toBe(channelId);
     expect(roomInfo.isDM).toBe(false);
     expect((roomInfo.memberCount ?? 0) >= 2).toBe(true);
-    expect(roomInfo.metadata?.roomID).toBe(roomID);
+    expect(roomInfo.metadata?.roomID).toBe(threadListRoomID);
 
     const rootPosted = await sender.adapter.postMessage(
-      sender.adapter.encodeThreadId({ roomID }),
+      sender.adapter.encodeThreadId({ roomID: threadListRoomID }),
       `Thread root ${rootTag}`
     );
 
     const threadId = sender.adapter.encodeThreadId({
-      roomID,
+      roomID: threadListRoomID,
       rootEventID: rootPosted.id,
     });
     await sender.adapter.postMessage(threadId, `Thread reply ${replyTag}`);
 
     await waitForFetchedMessage(
       bot.adapter,
-      bot.adapter.encodeThreadId({ roomID }),
+      bot.adapter.encodeThreadId({ roomID: threadListRoomID }),
       rootPosted.id,
       (message) => message.text.includes(rootTag)
     );
     await waitForMatchingMessage(
       bot.adapter,
-      bot.adapter.encodeThreadId({ roomID, rootEventID: rootPosted.id }),
+      bot.adapter.encodeThreadId({ roomID: threadListRoomID, rootEventID: rootPosted.id }),
       (message) => message.text.includes(replyTag)
     );
 
@@ -624,7 +651,7 @@ describe.skipIf(!hasCoreCredentials)("E2E Matrix Adapter", () => {
     expect(threadInfo.id).toBe(threadId);
     expect(threadInfo.channelId).toBe(channelId);
     expect(threadInfo.isDM).toBe(false);
-    expect(threadInfo.metadata?.roomID).toBe(roomID);
+    expect(threadInfo.metadata?.roomID).toBe(threadListRoomID);
 
     const threads = await bot.adapter.listThreads(channelId, { limit: 20 });
     const summary = threads.threads.find((thread) => thread.id === threadId);
