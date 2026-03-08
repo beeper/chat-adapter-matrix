@@ -20,24 +20,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.30.3
+
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache: npm
+          node-version: 22
+          cache: pnpm
           registry-url: https://registry.npmjs.org
 
       - name: Install dependencies
-        run: npm ci
+        run: pnpm install --frozen-lockfile
 
       - name: Typecheck
-        run: npm run typecheck
+        run: pnpm typecheck
 
       - name: Build
-        run: npm run build
+        run: pnpm build
 
       - name: Test
-        run: npm test
+        run: pnpm test
 
       - name: Verify tag matches package version
         if: startsWith(github.ref, 'refs/tags/v')
@@ -50,6 +55,6 @@ jobs:
           fi
 
       - name: Publish to npm
-        run: npm publish --provenance --access public
+        run: pnpm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

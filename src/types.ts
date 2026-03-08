@@ -1,12 +1,39 @@
-import type { IStartClientOpts, MatrixClient } from "matrix-js-sdk";
-import type { Logger } from "chat";
+import type { ICreateClientOpts, IStartClientOpts, MatrixClient } from "matrix-js-sdk";
+import type { Logger, StateAdapter } from "chat";
+import type { IStore } from "matrix-js-sdk/lib/store";
 
 export interface MatrixE2EEConfig {
   cryptoDatabasePrefix?: string;
-  enabled?: boolean;
   storageKey?: Uint8Array;
   storagePassword?: string;
   useIndexedDB?: boolean;
+}
+
+export interface MatrixPersistenceSyncConfig {
+  persistIntervalMs?: number;
+  snapshotTtlMs?: number;
+}
+
+export interface MatrixPersistenceSessionConfig {
+  decrypt?: (value: string) => string;
+  encrypt?: (value: string) => string;
+  ttlMs?: number;
+}
+
+export interface MatrixPersistenceConfig {
+  keyPrefix?: string;
+  session?: MatrixPersistenceSessionConfig;
+  sync?: MatrixPersistenceSyncConfig;
+}
+
+export interface MatrixCreateStoreOptions {
+  baseURL: string;
+  config: MatrixPersistenceSyncConfig;
+  deviceID?: string;
+  logger: Logger;
+  scopeKey: string;
+  state: StateAdapter;
+  userID: string;
 }
 
 export interface MatrixAccessTokenAuthConfig {
@@ -31,38 +58,30 @@ export interface MatrixAdapterConfig {
   auth: MatrixAuthConfig;
   baseURL: string;
   commandPrefix?: string;
+  createStore?: (options: MatrixCreateStoreOptions) => IStore;
   createBootstrapClient?: (
     options: { accessToken?: string; baseURL: string; deviceID?: string }
   ) => MatrixAuthBootstrapClient;
-  createClient?: () => MatrixClient;
-  deviceIDPersistence?: MatrixDeviceIDPersistenceConfig;
+  createClient?: (options?: ICreateClientOpts) => MatrixClient;
   deviceID?: string;
   e2ee?: MatrixE2EEConfig;
+  inviteAutoJoin?: MatrixInviteAutoJoinConfig;
   logger?: Logger;
   matrixSDKLogLevel?: "trace" | "debug" | "info" | "warn" | "error";
+  persistence?: MatrixPersistenceConfig;
   recoveryKey?: string;
   roomAllowlist?: string[];
-  session?: MatrixSessionConfig;
   sync?: IStartClientOpts;
   userName?: string;
+}
+
+export interface MatrixInviteAutoJoinConfig {
+  inviterAllowlist?: string[];
 }
 
 export interface MatrixThreadID {
   roomID: string;
   rootEventID?: string;
-}
-
-export interface MatrixSessionConfig {
-  enabled?: boolean;
-  encrypt?: (value: string) => string;
-  key?: string;
-  ttlMs?: number;
-  decrypt?: (value: string) => string;
-}
-
-export interface MatrixDeviceIDPersistenceConfig {
-  enabled?: boolean;
-  key?: string;
 }
 
 export interface MatrixAuthBootstrapClient {

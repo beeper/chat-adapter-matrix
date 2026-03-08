@@ -1,7 +1,10 @@
 {
   "name": "@beeper/chat-adapter-matrix",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Matrix adapter for chat",
+  "engines": {
+    "node": ">=22"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -18,26 +21,33 @@
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
-    "example:bun": "bun --env-file=examples/.env run examples/bot.ts",
-    "example:bun:redis": "bun --env-file=examples/.env run examples/bot.redis.ts",
-    "token:bun": "bun run scripts/get-access-token.ts",
+    "example": "node --experimental-strip-types --env-file=examples/.env examples/bot.ts",
+    "example:redis": "node --experimental-strip-types --env-file=examples/.env examples/bot.redis.ts",
+    "matrix-token": "node --experimental-strip-types scripts/get-access-token.ts",
     "clean:repo": "rm -rf dist coverage",
+    "lint:types": "eslint .",
     "test": "vitest run --coverage",
+    "test:e2e": "vitest run --config vitest.config.e2e.ts",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "pnpm lint:types && tsc --noEmit",
     "clean": "rm -rf dist"
   },
   "dependencies": {
-    "@chat-adapter/state-memory": "^4.13.4",
-    "@chat-adapter/state-redis": "^4.13.4",
-    "chat": "^4.13.4",
-    "matrix-js-sdk": "^41.0.0"
+    "@chat-adapter/state-memory": "^4.17.0",
+    "@chat-adapter/state-redis": "^4.17.0",
+    "chat": "^4.17.0",
+    "marked": "^15.0.12",
+    "matrix-js-sdk": "^41.0.0",
+    "node-html-parser": "^7.1.0"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/node": "^22.10.2",
     "@vitest/coverage-v8": "^2.1.8",
+    "eslint": "^10.0.2",
     "tsup": "^8.3.5",
     "typescript": "^5.7.2",
+    "typescript-eslint": "^8.56.1",
     "vitest": "^2.1.8"
   },
   "repository": {
@@ -57,5 +67,6 @@
     "bot",
     "adapter"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "packageManager": "pnpm@10.30.3"
 }
