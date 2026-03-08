@@ -1,4 +1,4 @@
-#!/usr/bin/env bun
+#!/usr/bin/env -S node --experimental-strip-types
 
 import { createInterface } from "node:readline/promises";
 import readline from "node:readline";
@@ -299,7 +299,7 @@ async function whoami(baseDomain: string, accessToken: string): Promise<WhoAmIRe
 }
 
 async function main(): Promise<void> {
-  output.write("Beeper Access Token Helper (Bun)\n\n");
+  output.write("Beeper Access Token Helper\n\n");
 
   const env = await promptChoice<BeeperEnv>(
     "Environment:",
