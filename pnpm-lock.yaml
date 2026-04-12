@@ -9,14 +9,14 @@ importers:
   .:
     dependencies:
       '@chat-adapter/state-memory':
-        specifier: ^4.17.0
-        version: 4.17.0
+        specifier: ^4.25.0
+        version: 4.25.0
       '@chat-adapter/state-redis':
-        specifier: ^4.17.0
-        version: 4.17.0
+        specifier: ^4.25.0
+        version: 4.25.0
       chat:
-        specifier: ^4.17.0
-        version: 4.17.0
+        specifier: ^4.25.0
+        version: 4.25.0
       marked:
         specifier: ^15.0.12
         version: 15.0.12
@@ -82,11 +82,11 @@ packages:
   '@bcoe/v8-coverage@0.2.3':
     resolution: {integrity: sha512-0hYQ8SB4Db5zvZB4axdMHGwEaQjkZzFjQiN9LVYvIFB2nSUHW9tYpxWriPrWDASIxiaXax83REcLxuSdnGPZtw==}
 
-  '@chat-adapter/state-memory@4.17.0':
-    resolution: {integrity: sha512-7LewkFY6gQVEXxAycaWUXax9Pt7Prmn2mBdoIBbTEAzV5bSQBaXqKyrd6VWCd9gEyxNlBUainyQul4iGNPw1sQ==}
+  '@chat-adapter/state-memory@4.25.0':
+    resolution: {integrity: sha512-bNM4ycFPfGHUI5TN3yo9wGG8ahgUXlKS7WLzhr8WnjmH6g6o8OebknihNh3WDw07xckJUoKDpOtE1uwChvgZag==}
 
-  '@chat-adapter/state-redis@4.17.0':
-    resolution: {integrity: sha512-sJ2V/pZESZKrGkuafMqg4gqyvHwz8d0JDUvqeZ+FVfEgT/h0g1kYfSc++qfEayzmPpSJxC6gzGpBGTiL/5utCw==}
+  '@chat-adapter/state-redis@4.25.0':
+    resolution: {integrity: sha512-XHZ6Kv9vbKP19YaRKXaurnsxzizHpQOkfY0P4JPS8oEGVKSCJ5a9ZEnlsT3guLG8zcO6cFqNR2Br+PmX6fh1Dw==}
 
   '@esbuild/aix-ppc64@0.21.5':
     resolution: {integrity: sha512-1SDgH6ZSPTlggy1yI6+Dbkiz8xzpHJEVAlF/AM1tHPLsf5STom9rwtjE4hKAF20FfXXNTFqEYXyJNWh1GiZedQ==}
@@ -849,8 +849,8 @@ packages:
   character-entities@2.0.2:
     resolution: {integrity: sha512-shx7oQ0Awen/BRIdkjkvz54PnEEI/EjwXDSIZp86/KKdbafHh1Df/RYGBhn4hbe2+uKC9FnT5UCEdyPz3ai9hQ==}
 
-  chat@4.17.0:
-    resolution: {integrity: sha512-kX9jIXmEU2ksnF1YshM+qfI/6pBy6k8pELkuRaE2AJyF/0nt4GUc0McBhn2DNpXLDI5sVwRGB3PmI+q5wUtYFg==}
+  chat@4.25.0:
+    resolution: {integrity: sha512-QM8ex4Gpn8zYIPyQXh41Who6R9Wq3WcQeOjAy4EuR1m1ha0tASuzHkLQfjaTAGLgrgrThV0Zh5KKoH0S92iwNA==}
 
   check-error@2.1.3:
     resolution: {integrity: sha512-PAJdDJusoxnwm1VwW07VWwUN1sl7smmC3OKggvndJFadxxDRyFJBX/ggnu/KE4kQAB7a3Dp8f/YXC1FlUprWmA==}
@@ -1797,15 +1797,15 @@ snapshots:
 
   '@bcoe/v8-coverage@0.2.3': {}
 
-  '@chat-adapter/state-memory@4.17.0':
+  '@chat-adapter/state-memory@4.25.0':
     dependencies:
-      chat: 4.17.0
+      chat: 4.25.0
     transitivePeerDependencies:
       - supports-color
 
-  '@chat-adapter/state-redis@4.17.0':
+  '@chat-adapter/state-redis@4.25.0':
     dependencies:
-      chat: 4.17.0
+      chat: 4.25.0
       redis: 5.11.0
     transitivePeerDependencies:
       - '@node-rs/xxhash'
@@ -2373,7 +2373,7 @@ snapshots:
 
   character-entities@2.0.2: {}
 
-  chat@4.17.0:
+  chat@4.25.0:
     dependencies:
       '@workflow/serde': 4.1.0-beta.2
       mdast-util-to-string: 4.0.0

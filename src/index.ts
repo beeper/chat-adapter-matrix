@@ -80,6 +80,7 @@ const DEFAULT_COMMAND_PREFIX = "/";
 const DEFAULT_PERSISTENCE_KEY_PREFIX = "matrix";
 const TYPING_TIMEOUT_MS = 30_000;
 const DEFAULT_MATRIX_STORE_PERSIST_INTERVAL_MS = 30_000;
+const DEFAULT_OVERSIZED_MESSAGE_CHUNK_BYTES = 12_000;
 const FAST_SYNC_DEFAULTS: NonNullable<MatrixAdapterConfig["sync"]> = {
   initialSyncLimit: 1,
   lazyLoadMembers: true,
@@ -420,14 +421,20 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     message: AdapterPostableMessage
   ): Promise<RawMessage<MatrixEvent>> {
     const { roomID, rootEventID } = this.decodeThreadId(threadId);
+    const replyEventID = this.extractReplyEventID(message);
     const contents = await this.toRoomMessageContents(message);
     const [firstContent, ...extraContents] = contents;
     if (!firstContent) {
       throw new Error("Cannot post an empty Matrix message.");
     }
-    const response = await this.sendRoomMessage(roomID, rootEventID, firstContent);
+    const response = await this.sendRoomMessage(
+      roomID,
+      rootEventID,
+      replyEventID,
+      firstContent,
+    );
     for (const content of extraContents) {
-      await this.sendRoomMessage(roomID, rootEventID, content);
+      await this.sendRoomMessage(roomID, rootEventID, replyEventID, content);
     }
 
     return {
@@ -472,7 +479,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       body: `* ${baseContent.body}`,
     };
 
-    const response = await this.sendRoomMessage(roomID, rootEventID, editContent);
+    const response = await this.sendRoomMessage(roomID, rootEventID, undefined, editContent);
 
     return {
       id: response.event_id,
@@ -1504,27 +1511,56 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   private async sendRoomMessage(
     roomID: string,
     rootEventID: string | undefined,
+    replyEventID: string | undefined,
     content: MatrixOutboundMessageContent
   ) {
-    const response = await this.withLoggedMatrixOperation(
-      "Matrix send message failed",
-      {
+    const threadContent = this.applyThreadReplyMetadata(content, rootEventID, replyEventID);
+
+    try {
+      const response = await this.performSendRoomMessage(roomID, rootEventID, threadContent);
+      void this.maybePersistSecretsBundle();
+      return response;
+    } catch (error) {
+      if (this.isTooLargeMatrixError(error)) {
+        const splitContents = this.splitOversizedTextContent(threadContent);
+        if (splitContents.length > 1) {
+          this.logger.warn(
+            "Matrix message exceeded size limit; retrying as split plain-text chunks",
+            {
+              roomId: roomID,
+              rootEventId: rootEventID,
+              originalLength: typeof threadContent.body === "string" ? threadContent.body.length : undefined,
+              chunkCount: splitContents.length,
+              msgtype: threadContent.msgtype,
+            }
+          );
+
+          let firstResponse: Awaited<ReturnType<MatrixClient["sendEvent"]>> | undefined;
+          for (const splitContent of splitContents) {
+            const response = await this.sendRoomMessage(
+              roomID,
+              rootEventID,
+              replyEventID,
+              splitContent
+            );
+            firstResponse ??= response;
+          }
+
+          if (firstResponse) {
+            return firstResponse;
+          }
+        }
+      }
+
+      this.logger.error("Matrix send message failed", {
         roomId: roomID,
         rootEventId: rootEventID,
         eventType: EventType.RoomMessage,
         msgtype: content.msgtype,
-      },
-      async () => {
-        const client = this.requireClient();
-        if (rootEventID) {
-          return client.sendEvent(roomID, rootEventID, EventType.RoomMessage, content);
-        }
-
-        return client.sendEvent(roomID, EventType.RoomMessage, content);
-      }
-    );
-    void this.maybePersistSecretsBundle();
-    return response;
+        error,
+      });
+      throw error;
+    }
   }
 
   private async toRoomMessageContents(
@@ -1860,7 +1896,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
         raw: event,
         user: message.author,
         triggerId: event.getId(),
-      });
+      }, undefined);
     }
   }
 
@@ -2592,6 +2628,184 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       command,
       text: tokens.slice(1).join(" "),
     };
+  }
+
+  private extractReplyEventID(message: AdapterPostableMessage): string | undefined {
+    if (typeof message !== "object" || message === null || isCardElement(message)) {
+      return undefined;
+    }
+
+    const replyEventID = (message as { matrixReplyToEventId?: unknown }).matrixReplyToEventId;
+    return typeof replyEventID === "string" && replyEventID.length > 0
+      ? replyEventID
+      : undefined;
+  }
+
+  private applyThreadReplyMetadata(
+    content: MatrixOutboundMessageContent,
+    rootEventID: string | undefined,
+    replyEventID: string | undefined
+  ): MatrixOutboundMessageContent {
+    const threadableContent = content as MatrixOutboundMessageContent & {
+      "m.relates_to"?: {
+        rel_type?: string;
+        "m.in_reply_to"?: { event_id: string };
+        [key: string]: unknown;
+      };
+    };
+
+    if (!rootEventID || threadableContent["m.relates_to"]?.rel_type) {
+      return threadableContent;
+    }
+
+    return {
+      ...threadableContent,
+      "m.relates_to": {
+        ...threadableContent["m.relates_to"],
+        "m.in_reply_to": {
+          event_id: replyEventID ?? rootEventID,
+        },
+      },
+    } as MatrixOutboundMessageContent;
+  }
+
+  private async performSendRoomMessage(
+    roomID: string,
+    rootEventID: string | undefined,
+    content: MatrixOutboundMessageContent
+  ) {
+    const client = this.requireClient();
+    if (rootEventID) {
+      return client.sendEvent(
+        roomID,
+        rootEventID,
+        EventType.RoomMessage,
+        content as RoomMessageEventContent
+      );
+    }
+
+    return client.sendEvent(roomID, EventType.RoomMessage, content);
+  }
+
+  private isTooLargeMatrixError(error: unknown): error is MatrixError {
+    return (
+      error instanceof MatrixError &&
+      (error.errcode === "M_TOO_LARGE" || error.httpStatus === 413)
+    );
+  }
+
+  private splitOversizedTextContent(
+    content: MatrixOutboundMessageContent
+  ): MatrixTextMessageContent[] {
+    if (!this.isSplittableTextContent(content)) {
+      return [];
+    }
+
+    const body = content.body;
+    if (this.utf8ByteLength(body) <= DEFAULT_OVERSIZED_MESSAGE_CHUNK_BYTES) {
+      return [];
+    }
+
+    const parts = this.splitTextByUtf8Bytes(body, DEFAULT_OVERSIZED_MESSAGE_CHUNK_BYTES);
+    if (parts.length <= 1) {
+      return [];
+    }
+
+    return parts.map((part) => ({
+      body: part,
+      msgtype: content.msgtype,
+    }));
+  }
+
+  private isSplittableTextContent(
+    content: MatrixOutboundMessageContent
+  ): content is MatrixTextMessageContent {
+    if ("url" in content || "info" in content) {
+      return false;
+    }
+
+    if (typeof content.body !== "string" || content.body.length <= 1) {
+      return false;
+    }
+
+    if ("m.new_content" in content) {
+      return false;
+    }
+
+    return (
+      content.msgtype === MsgType.Text ||
+      content.msgtype === MsgType.Notice ||
+      content.msgtype === MsgType.Emote
+    );
+  }
+
+  private splitTextByUtf8Bytes(text: string, maxBytes: number): string[] {
+    const normalizedMaxBytes = Math.max(1, Math.floor(maxBytes));
+    const chunks: string[] = [];
+    let remaining = text;
+
+    while (remaining.length > 0) {
+      if (this.utf8ByteLength(remaining) <= normalizedMaxBytes) {
+        chunks.push(remaining);
+        remaining = "";
+        break;
+      }
+
+      const boundary = this.findSplitBoundary(remaining, normalizedMaxBytes);
+      const head = remaining.slice(0, boundary).trimEnd();
+      const tail = remaining.slice(boundary).trimStart();
+
+      if (!head || head === remaining) {
+        break;
+      }
+
+      chunks.push(head);
+      remaining = tail;
+    }
+
+    if (remaining.length > 0 && chunks.at(-1) !== remaining) {
+      chunks.push(remaining);
+    }
+
+    return chunks.filter((chunk) => chunk.length > 0);
+  }
+
+  private findSplitBoundary(text: string, maxBytes: number): number {
+    let low = 1;
+    let high = text.length;
+    let best = 1;
+
+    while (low <= high) {
+      const mid = Math.floor((low + high) / 2);
+      const candidate = text.slice(0, mid);
+      if (this.utf8ByteLength(candidate) <= maxBytes) {
+        best = mid;
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
+    }
+
+    for (const pattern of [/\n{2,}/gu, /\n/gu, /\s+/gu]) {
+      let match: RegExpExecArray | null = null;
+      let lastBoundary: number | null = null;
+      pattern.lastIndex = 0;
+      while ((match = pattern.exec(text)) !== null) {
+        if (match.index >= best) {
+          break;
+        }
+        lastBoundary = match.index + match[0].length;
+      }
+      if (lastBoundary && lastBoundary > 0) {
+        return lastBoundary;
+      }
+    }
+
+    return best;
+  }
+
+  private utf8ByteLength(text: string): number {
+    return Buffer.byteLength(text, "utf8");
   }
 
   private toRoomMessageContent(

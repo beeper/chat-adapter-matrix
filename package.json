@@ -1,6 +1,6 @@
 {
   "name": "@beeper/chat-adapter-matrix",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Matrix adapter for chat",
   "engines": {
     "node": ">=22"
@@ -33,9 +33,9 @@
     "clean": "rm -rf dist"
   },
   "dependencies": {
-    "@chat-adapter/state-memory": "^4.17.0",
-    "@chat-adapter/state-redis": "^4.17.0",
-    "chat": "^4.17.0",
+    "@chat-adapter/state-memory": "^4.25.0",
+    "@chat-adapter/state-redis": "^4.25.0",
+    "chat": "^4.25.0",
     "marked": "^15.0.12",
     "matrix-js-sdk": "^41.0.0",
     "node-html-parser": "^7.1.0"

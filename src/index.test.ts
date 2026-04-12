@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { Chat, getEmoji, stringifyMarkdown } from "chat";
-import type { ChatInstance, Logger, StateAdapter } from "chat";
+import type { AdapterPostableMessage, ChatInstance, Logger, StateAdapter } from "chat";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { EventType, MsgType, RelationType, type MatrixClient } from "matrix-js-sdk";
 import { MatrixError } from "matrix-js-sdk/lib/http-api/errors";
@@ -310,6 +310,8 @@ function makeStateAdapter(initial: Record<string, unknown> = {}): StateAdapter {
     return run();
   };
   const get: StateAdapter["get"] = (key) => afterReady(() => base.get(key));
+  const getList: StateAdapter["getList"] = (key) =>
+    afterReady(() => base.getList(key));
   const set: StateAdapter["set"] = (key, value, ttlMs) =>
     afterReady(() => base.set(key, value, ttlMs));
   const setIfNotExists: StateAdapter["setIfNotExists"] = (key, value, ttlMs) =>
@@ -319,14 +321,26 @@ function makeStateAdapter(initial: Record<string, unknown> = {}): StateAdapter {
     acquireLock: vi.fn((threadId, ttlMs) =>
       afterReady(() => base.acquireLock(threadId, ttlMs))
     ),
+    appendToList: vi.fn((key, value, options) =>
+      afterReady(() => base.appendToList(key, value, options))
+    ),
     connect: vi.fn(connect),
     delete: vi.fn((key) => afterReady(() => base.delete(key))),
+    dequeue: vi.fn((threadId) => afterReady(() => base.dequeue(threadId))),
     disconnect: vi.fn(() => afterReady(() => base.disconnect())),
+    enqueue: vi.fn((threadId, entry, maxSize) =>
+      afterReady(() => base.enqueue(threadId, entry, maxSize))
+    ),
     extendLock: vi.fn((lock, ttlMs) =>
       afterReady(() => base.extendLock(lock, ttlMs))
     ),
+    forceReleaseLock: vi.fn((threadId) =>
+      afterReady(() => base.forceReleaseLock(threadId))
+    ),
     get,
+    getList,
     isSubscribed: vi.fn((threadId) => afterReady(() => base.isSubscribed(threadId))),
+    queueDepth: vi.fn((threadId) => afterReady(() => base.queueDepth(threadId))),
     releaseLock: vi.fn((lock) => afterReady(() => base.releaseLock(lock))),
     set: vi.fn(set),
     setIfNotExists: vi.fn(setIfNotExists),
@@ -1069,6 +1083,53 @@ describe("MatrixAdapter", () => {
     expect(channel.metadata).toMatchObject(thread.metadata ?? {});
   });
 
+  it("adds reply fallback metadata when posting to a Matrix thread", async () => {
+    const fakeClient = makeClient();
+    const adapter = await makeInitializedAdapter(fakeClient);
+
+    await adapter.postMessage("matrix:!room%3Abeeper.com:%24root", "hello");
+
+    expect(fakeClient.sendEvent).toHaveBeenCalledWith(
+      "!room:beeper.com",
+      "$root",
+      EventType.RoomMessage,
+      expect.objectContaining({
+        body: "hello",
+        msgtype: MsgType.Text,
+        "m.relates_to": {
+          "m.in_reply_to": {
+            event_id: "$root",
+          },
+        },
+      })
+    );
+  });
+
+  it("uses an explicit reply target when posting within a Matrix thread", async () => {
+    const fakeClient = makeClient();
+    const adapter = await makeInitializedAdapter(fakeClient);
+
+    await adapter.postMessage("matrix:!room%3Abeeper.com:%24root", {
+      raw: "hello",
+      matrixReplyToEventId: "$reply",
+    } as AdapterPostableMessage);
+
+    expect(fakeClient.sendEvent).toHaveBeenCalledWith(
+      "!room:beeper.com",
+      "$root",
+      EventType.RoomMessage,
+      expect.objectContaining({
+        body: "hello",
+        msgtype: MsgType.Text,
+        "m.relates_to": {
+          "m.in_reply_to": {
+            event_id: "$reply",
+          },
+        },
+      })
+    );
+  });
+
   it("uploads file payloads and posts Matrix media events", async () => {
     const fakeClient = makeClient();
     fakeClient.sendEvent = vi
@@ -1195,6 +1256,114 @@ describe("MatrixAdapter", () => {
         eventType: EventType.RoomMessage,
         msgtype: "m.text",
         error: sendError,
+      })
+    );
+  });
+
+  it("retries oversized rich-text events as split plain-text messages", async () => {
+    const fakeClient = makeClient();
+    const logger = makeTestLogger();
+    const tooLargeError = new MatrixError(
+      { errcode: "M_TOO_LARGE", error: "event too large" },
+      413
+    );
+    fakeClient.sendEvent = vi
+      .fn()
+      .mockRejectedValueOnce(tooLargeError)
+      .mockResolvedValueOnce({ event_id: "$chunk-1" })
+      .mockResolvedValueOnce({ event_id: "$chunk-2" });
+
+    const adapter = new MatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: {
+        type: "accessToken",
+        accessToken: "token",
+        userID: "@bot:beeper.com",
+      },
+      logger: logger.logger,
+      createClient: () => asMatrixClient(fakeClient),
+    });
+    await adapter.initialize(makeChatInstance());
+
+    const repeatedMarkdown = Array.from({ length: 2_000 }, () => "**hello** `world`").join("\n");
+    const sent = await adapter.postMessage("matrix:!room%3Abeeper.com", {
+      markdown: repeatedMarkdown,
+    });
+
+    expect(sent.id).toBe("$chunk-1");
+    expect(fakeClient.sendEvent).toHaveBeenCalledTimes(3);
+    expect(fakeClient.sendEvent).toHaveBeenNthCalledWith(
+      1,
+      "!room:beeper.com",
+      EventType.RoomMessage,
+      expect.objectContaining({
+        format: "org.matrix.custom.html",
+        formatted_body: expect.any(String),
+      })
+    );
+
+    const fallbackBodies = (fakeClient.sendEvent.mock.calls as unknown as Array<unknown[]>)
+      .slice(1)
+      .map((call) => call[2] as unknown as Record<string, unknown>);
+    expect(fallbackBodies).toHaveLength(2);
+    expect(fallbackBodies.map((content) => content.body).join("\n"))
+      .toBe(Array.from({ length: 2_000 }, () => "hello world").join("\n"));
+    for (const content of fallbackBodies) {
+      expect(content).toMatchObject({ msgtype: MsgType.Text });
+      expect(content).not.toHaveProperty("format");
+      expect(content).not.toHaveProperty("formatted_body");
+      expect(content).not.toHaveProperty("m.mentions");
+    }
+
+    expect(logger.warn).toHaveBeenCalledWith(
+      "Matrix message exceeded size limit; retrying as split plain-text chunks",
+      expect.objectContaining({
+        roomId: "!room:beeper.com",
+        chunkCount: 2,
+        msgtype: MsgType.Text,
+      })
+    );
+    expect(logger.error).not.toHaveBeenCalled();
+  });
+
+  it("rethrows M_TOO_LARGE for non-text Matrix events", async () => {
+    const fakeClient = makeClient();
+    const logger = makeTestLogger();
+    const tooLargeError = new MatrixError(
+      { errcode: "M_TOO_LARGE", error: "event too large" },
+      413
+    );
+    fakeClient.sendEvent = vi.fn().mockRejectedValue(tooLargeError);
+
+    const adapter = new MatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: {
+        type: "accessToken",
+        accessToken: "token",
+        userID: "@bot:beeper.com",
+      },
+      logger: logger.logger,
+      createClient: () => asMatrixClient(fakeClient),
+    });
+    await adapter.initialize(makeChatInstance());
+
+    await expect(
+      adapter.postMessage("matrix:!room%3Abeeper.com", {
+        files: [
+          {
+            data: new Uint8Array([1, 2, 3]).buffer,
+            filename: "report.png",
+            mimeType: "image/png",
+          },
+        ],
+      } as AdapterPostableMessage)
+    ).rejects.toBe(tooLargeError);
+    expect(logger.error).toHaveBeenCalledWith(
+      "Matrix send message failed",
+      expect.objectContaining({
+        roomId: "!room:beeper.com",
+        msgtype: MsgType.Image,
+        error: tooLargeError,
       })
     );
   });
