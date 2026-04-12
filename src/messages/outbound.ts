@@ -23,7 +23,7 @@ import {
   escapeMarkdownLinkText,
   escapeMarkdownText,
   isRecord,
-  matrixLocalpart,
+  matrixMentionDisplayText,
   normalizeOptionalString,
 } from "../shared/utils";
 
@@ -86,7 +86,7 @@ export function extractReplyEventID(
 export function applyThreadReplyMetadata(
   content: MatrixOutboundMessageContent,
   rootEventID: string | undefined,
-  replyEventID: string | undefined
+  replyEventID: string | null | undefined
 ): MatrixOutboundMessageContent {
   const threadableContent = content as MatrixOutboundMessageContent & {
     "m.relates_to"?: {
@@ -97,6 +97,10 @@ export function applyThreadReplyMetadata(
   };
 
   if (!rootEventID || threadableContent["m.relates_to"]?.rel_type) {
+    return threadableContent;
+  }
+
+  if (replyEventID === null) {
     return threadableContent;
   }
 
@@ -478,10 +482,6 @@ function matrixToUserLink(userID: string): string {
   return `https://matrix.to/#/${encodeURIComponent(userID)}`;
 }
 
-function matrixMentionDisplayText(userID: string): string {
-  return `@${matrixLocalpart(userID)}`;
-}
-
 function isSplittableTextContent(
   content: MatrixOutboundMessageContent
 ): content is MatrixTextMessageContent {
@@ -516,9 +516,14 @@ function splitTextByUtf8Bytes(text: string, maxBytes: number): string[] {
       break;
     }
 
-    const boundary = findSplitBoundary(remaining, normalizedMaxBytes);
-    const head = remaining.slice(0, boundary).trimEnd();
-    const tail = remaining.slice(boundary).trimStart();
+    const boundary = clampSurrogateBoundary(
+      remaining,
+      findSplitBoundary(remaining, normalizedMaxBytes)
+    );
+    const rawHead = remaining.slice(0, boundary);
+    const rawTail = remaining.slice(boundary);
+    const head = trimEndPreservingSurrogates(rawHead);
+    const tail = trimStartPreservingSurrogates(rawTail);
 
     if (!head || head === remaining) {
       break;
@@ -542,9 +547,9 @@ function findSplitBoundary(text: string, maxBytes: number): number {
 
   while (low <= high) {
     const mid = Math.floor((low + high) / 2);
-    const candidate = text.slice(0, mid);
+    const candidate = text.slice(0, clampSurrogateBoundary(text, mid));
     if (Buffer.byteLength(candidate, "utf8") <= maxBytes) {
-      best = mid;
+      best = candidate.length;
       low = mid + 1;
     } else {
       high = mid - 1;
@@ -559,6 +564,44 @@ function findSplitBoundary(text: string, maxBytes: number): number {
   }
 
   return best;
+}
+
+function trimEndPreservingSurrogates(text: string): string {
+  let boundary = text.length;
+  while (boundary > 0 && /\s/.test(text[boundary - 1] ?? "")) {
+    boundary -= 1;
+  }
+  return text.slice(0, clampSurrogateBoundary(text, boundary));
+}
+
+function trimStartPreservingSurrogates(text: string): string {
+  let boundary = 0;
+  while (boundary < text.length && /\s/.test(text[boundary] ?? "")) {
+    boundary += 1;
+  }
+  return text.slice(clampSurrogateBoundary(text, boundary));
+}
+
+function clampSurrogateBoundary(text: string, boundary: number): number {
+  if (boundary <= 0 || boundary >= text.length) {
+    return boundary;
+  }
+
+  const current = text.charCodeAt(boundary);
+  const previous = text.charCodeAt(boundary - 1);
+  if (isLowSurrogateCodeUnit(current) && isHighSurrogateCodeUnit(previous)) {
+    return boundary - 1;
+  }
+
+  return boundary;
+}
+
+function isHighSurrogateCodeUnit(code: number): boolean {
+  return code >= 0xd800 && code <= 0xdbff;
+}
+
+function isLowSurrogateCodeUnit(code: number): boolean {
+  return code >= 0xdc00 && code <= 0xdfff;
 }
 
 function isNodeBuffer(value: unknown): value is Buffer {

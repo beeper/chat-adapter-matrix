@@ -170,6 +170,11 @@ type MatrixRoomMetadata = {
   topic?: string;
 };
 
+type SentRoomMessage = {
+  response: Awaited<ReturnType<MatrixClient["sendEvent"]>>;
+  sentContent: MatrixOutboundMessageContent;
+};
+
 // Intentionally unsupported in this adapter: postEphemeral, openModal, and native stream.
 export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   readonly name = "matrix";
@@ -366,21 +371,21 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     if (!firstContent) {
       throw new Error("Cannot post an empty Matrix message.");
     }
-    const response = await this.sendRoomMessage(
+    const { response, sentContent } = await this.sendRoomMessage(
       roomID,
       rootEventID,
       replyEventID,
       firstContent,
     );
     for (const content of extraContents) {
-      await this.sendRoomMessage(roomID, rootEventID, undefined, content);
+      await this.sendRoomMessage(roomID, rootEventID, null, content);
     }
 
     return {
       id: response.event_id,
       threadId,
       raw: this.resolveSentEvent(roomID, response.event_id, {
-        content: firstContent,
+        content: sentContent,
         roomID,
         sender: this.userID,
       }),
@@ -418,13 +423,18 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       body: `* ${baseContent.body}`,
     };
 
-    const response = await this.sendRoomMessage(roomID, rootEventID, undefined, editContent);
+    const { response, sentContent } = await this.sendRoomMessage(
+      roomID,
+      rootEventID,
+      null,
+      editContent
+    );
 
     return {
       id: response.event_id,
       threadId,
       raw: this.resolveSentEvent(roomID, response.event_id, {
-        content: editContent,
+        content: sentContent,
         roomID,
         sender: this.userID,
       }),
@@ -559,7 +569,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     const direction = options.direction ?? "backward";
     const limit = options.limit ?? 50;
     const cursor = options.cursor
-      ? this.decodeCursorV1(
+      ? decodeCursorV1(
           options.cursor,
           rootEventID ? "thread_relations" : "room_messages",
           roomID,
@@ -580,7 +590,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       return {
         messages: response.events.map((event) => this.parseMessageInternal(event)),
         nextCursor: response.nextToken
-          ? this.encodeCursorV1({
+          ? encodeCursorV1({
               kind: "room_messages",
               dir: direction,
               token: response.nextToken,
@@ -605,7 +615,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
         this.parseMessageInternal(event, this.encodeThreadId({ roomID, rootEventID }))
       ),
       nextCursor: response.nextToken
-        ? this.encodeCursorV1({
+        ? encodeCursorV1({
             kind: "thread_relations",
             dir: direction,
             token: response.nextToken,
@@ -682,7 +692,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     const roomID = this.decodeThreadId(channelId).roomID;
     const limit = options.limit ?? 50;
     const cursor = options.cursor
-      ? this.decodeCursorV1(options.cursor, "thread_list", roomID, undefined, "backward")
+      ? decodeCursorV1(options.cursor, "thread_list", roomID, undefined, "backward")
       : null;
     const listResponse = await this.requireClient().createThreadListMessagesRequest(
       roomID,
@@ -717,7 +727,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     return {
       threads: summaries,
       nextCursor: listResponse.end
-        ? this.encodeCursorV1({
+        ? encodeCursorV1({
             kind: "thread_list",
             dir: "backward",
             token: listResponse.end,
@@ -765,30 +775,6 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     });
   }
 
-  private encodeCursorV1(payload: CursorV1Payload): string {
-    return encodeCursorV1(payload);
-  }
-
-  private decodeCursorV1(
-    cursor: string,
-    expectedKind: CursorKind,
-    expectedRoomID: string,
-    expectedRootEventID?: string,
-    expectedDirection?: CursorDirection
-  ): CursorV1Payload {
-    return decodeCursorV1(
-      cursor,
-      expectedKind,
-      expectedRoomID,
-      expectedRootEventID,
-      expectedDirection
-    );
-  }
-
-  private toSDKDirection(dir: CursorDirection): Direction {
-    return toSDKDirection(dir);
-  }
-
   private async fetchRoomMessagesPage(args: {
     roomID: string;
     includeThreadReplies: boolean;
@@ -800,7 +786,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       args.roomID,
       args.fromToken,
       args.limit,
-      this.toSDKDirection(args.direction)
+      toSDKDirection(args.direction)
     );
     const messageChunk = (response.chunk ?? []).filter(
       (raw) =>
@@ -847,7 +833,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       THREAD_RELATION_TYPE.name,
       null,
       {
-        dir: this.toSDKDirection(args.direction),
+        dir: toSDKDirection(args.direction),
         from: args.fromToken ?? undefined,
         limit: relationLimit,
       }
@@ -1408,15 +1394,18 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   private async sendRoomMessage(
     roomID: string,
     rootEventID: string | undefined,
-    replyEventID: string | undefined,
+    replyEventID: string | null | undefined,
     content: MatrixOutboundMessageContent
-  ) {
+  ): Promise<SentRoomMessage> {
     const threadContent = applyThreadReplyMetadata(content, rootEventID, replyEventID);
 
     try {
       const response = await this.performSendRoomMessage(roomID, rootEventID, threadContent);
       void this.maybePersistSecretsBundle();
-      return response;
+      return {
+        response,
+        sentContent: threadContent,
+      };
     } catch (error) {
       if (isTooLargeMatrixError(error)) {
         const splitContents = splitOversizedTextContent(threadContent);
@@ -1432,7 +1421,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
             }
           );
 
-          let firstResponse: Awaited<ReturnType<MatrixClient["sendEvent"]>> | undefined;
+          let firstSentMessage: SentRoomMessage | undefined;
           for (const splitContent of splitContents) {
             const chunkWithMeta = applyThreadReplyMetadata(
               splitContent,
@@ -1441,11 +1430,14 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
             );
             const response = await this.performSendRoomMessage(roomID, rootEventID, chunkWithMeta);
             void this.maybePersistSecretsBundle();
-            firstResponse ??= response;
+            firstSentMessage ??= {
+              response,
+              sentContent: chunkWithMeta,
+            };
           }
 
-          if (firstResponse) {
-            return firstResponse;
+          if (firstSentMessage) {
+            return firstSentMessage;
           }
         }
       }
@@ -1609,6 +1601,10 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   }
 
   private async maybePersistSecretsBundle(force = false): Promise<void> {
+    if (!force && Date.now() - this.lastSecretsBundlePersistAt < 60_000) {
+      return;
+    }
+
     if (!this.stateAdapter) {
       return;
     }
@@ -1624,9 +1620,6 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     }
 
     const now = Date.now();
-    if (!force && now - this.lastSecretsBundlePersistAt < 60_000) {
-      return;
-    }
 
     try {
       const bundle = await crypto.exportSecretsBundle();
@@ -2301,26 +2294,33 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       });
     }
 
-    for (const attachment of attachments) {
-      const data = await readAttachmentData(attachment);
-      if (!data) {
-        continue;
+    const attachmentUploads = await Promise.all(
+      attachments.map(async (attachment): Promise<OutboundUpload | null> => {
+        const data = await readAttachmentData(attachment);
+        if (!data) {
+          return null;
+        }
+        const fileName =
+          normalizeOptionalString(attachment.name) ??
+          defaultAttachmentName(attachment);
+        return {
+          data: normalizeUploadData(data),
+          fileName,
+          info: {
+            h: attachment.height,
+            mimetype: normalizeOptionalString(attachment.mimeType),
+            size: attachment.size ?? binarySize(data),
+            w: attachment.width,
+          },
+          msgtype: messageTypeForAttachment(attachment),
+          type: attachment.type,
+        };
+      })
+    );
+    for (const upload of attachmentUploads) {
+      if (upload) {
+        uploads.push(upload);
       }
-      const fileName =
-        normalizeOptionalString(attachment.name) ??
-        defaultAttachmentName(attachment);
-      uploads.push({
-        data: normalizeUploadData(data),
-        fileName,
-        info: {
-          h: attachment.height,
-          mimetype: normalizeOptionalString(attachment.mimeType),
-          size: attachment.size ?? binarySize(data),
-          w: attachment.width,
-        },
-        msgtype: messageTypeForAttachment(attachment),
-        type: attachment.type,
-      });
     }
 
     return uploads;
@@ -2340,7 +2340,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     roomID: string,
     eventID: string,
     fallback: {
-      content: MatrixRoomMessageContent;
+      content: MatrixOutboundMessageContent;
       roomID: string;
       sender?: string;
     }
@@ -2611,9 +2611,6 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     ]);
 
     for (const key of candidates) {
-      if (!key) {
-        continue;
-      }
       const value = await this.stateAdapter.get<string | null>(key);
       const normalized = normalizeOptionalString(value);
       if (normalized) {

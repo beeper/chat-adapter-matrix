@@ -6,6 +6,7 @@ import { EventType, MsgType, RelationType, type MatrixClient } from "matrix-js-s
 import { MatrixError } from "matrix-js-sdk/lib/http-api/errors";
 import { encodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key";
 import { createMatrixAdapter, MatrixAdapter } from "./index";
+import { splitOversizedTextContent } from "./messages/outbound";
 
 type RawEventLike = {
   content?: Record<string, unknown>;
@@ -1181,6 +1182,43 @@ describe("MatrixAdapter", () => {
     );
   });
 
+  it("omits reply fallback metadata for follow-up attachments in Matrix threads", async () => {
+    const fakeClient = makeClient();
+    fakeClient.sendEvent = vi
+      .fn()
+      .mockResolvedValueOnce({ event_id: "$text" })
+      .mockResolvedValueOnce({ event_id: "$file" });
+    fakeClient.uploadContent = vi
+      .fn()
+      .mockResolvedValueOnce({ content_uri: "mxc://beeper.com/file-1" });
+
+    const adapter = await makeInitializedAdapter(fakeClient);
+
+    await adapter.postMessage("matrix:!room%3Abeeper.com:%24root", {
+      markdown: "File incoming",
+      files: [
+        {
+          data: new Uint8Array([1, 2, 3]).buffer,
+          filename: "report.png",
+          mimeType: "image/png",
+        },
+      ],
+    });
+
+    const sendCalls = fakeClient.sendEvent.mock.calls as unknown as Array<unknown[]>;
+    const firstContent = sendCalls[0]?.[3] as Record<string, unknown>;
+    const secondContent = sendCalls[1]?.[3] as Record<string, unknown>;
+
+    expect(firstContent).toMatchObject({
+      "m.relates_to": {
+        "m.in_reply_to": {
+          event_id: "$root",
+        },
+      },
+    });
+    expect(secondContent).not.toHaveProperty("m.relates_to");
+  });
+
   it("skips invalid file uploads instead of passing malformed entries downstream", async () => {
     const fakeClient = makeClient();
     const logger = makeTestLogger();
@@ -1267,6 +1305,11 @@ describe("MatrixAdapter", () => {
       { errcode: "M_TOO_LARGE", error: "event too large" },
       413
     );
+    fakeClient.getRoom.mockReturnValue(
+      makeRoom({
+        findEventById: () => null,
+      })
+    );
     fakeClient.sendEvent = vi
       .fn()
       .mockRejectedValueOnce(tooLargeError)
@@ -1314,6 +1357,7 @@ describe("MatrixAdapter", () => {
       expect(content).not.toHaveProperty("formatted_body");
       expect(content).not.toHaveProperty("m.mentions");
     }
+    expect(sent.raw.getContent()).toMatchObject(fallbackBodies[0] ?? {});
 
     expect(logger.warn).toHaveBeenCalledWith(
       "Matrix message exceeded size limit; retrying as split plain-text chunks",
@@ -1444,6 +1488,24 @@ describe("MatrixAdapter", () => {
         body: "See attachment\n\nspec: https://example.com/spec.pdf",
       })
     );
+  });
+
+  it("splits oversized text without cutting surrogate pairs", () => {
+    const content = splitOversizedTextContent({
+      body: "😀".repeat(4_000),
+      msgtype: MsgType.Text,
+    });
+
+    expect(content.length).toBeGreaterThan(1);
+    expect(content.map((part) => part.body).join("")).toBe("😀".repeat(4_000));
+
+    for (const part of content) {
+      const body = part.body;
+      const lastCodeUnit = body.charCodeAt(body.length - 1);
+      const firstCodeUnit = body.charCodeAt(0);
+      expect(lastCodeUnit < 0xd800 || lastCodeUnit > 0xdbff).toBe(true);
+      expect(firstCodeUnit < 0xdc00 || firstCodeUnit > 0xdfff).toBe(true);
+    }
   });
 
   it("generates and persists a device id when one is not provided", async () => {

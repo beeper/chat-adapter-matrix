@@ -9,6 +9,7 @@ import {
 import {
   escapeMarkdownText,
   isRecord,
+  matrixMentionDisplayText,
   normalizeOptionalString,
 } from "../shared/utils";
 
@@ -99,7 +100,12 @@ export function isMentioned(args: {
 function parseMatrixHTML(
   html: string
 ): { markdown: string; mentionedUserIDs: Set<string> } {
-  const root = parseHTML(stripReplyFallbackFromHTML(html));
+  const root = parseHTML(html);
+  for (const child of [...root.childNodes]) {
+    if (child instanceof HTMLElement && child.tagName.toLowerCase() === "mx-reply") {
+      child.remove();
+    }
+  }
   const mentionedUserIDs = new Set<string>();
   const markdown = normalizeMarkdownSpacing(
     renderHTMLNodesToMarkdown(root.childNodes, mentionedUserIDs)
@@ -289,22 +295,6 @@ function stripReplyFallbackFromBody(body: string): string {
   return lines.slice(index + 1).join("\n");
 }
 
-function stripReplyFallbackFromHTML(html: string): string {
-  const root = parseHTML(html);
-  for (const child of [...root.childNodes]) {
-    if (child instanceof HTMLElement && child.tagName.toLowerCase() === "mx-reply") {
-      child.remove();
-    }
-  }
-  return root.toString();
-}
-
-function matrixMentionDisplayText(userID: string): string {
-  const localpart = userID.startsWith("@")
-    ? userID.slice(1).split(":")[0] ?? userID
-    : userID;
-  return `@${localpart}`;
-}
 
 function markdownForPlainText(text: string, msgtype?: string): string {
   const escaped = escapeMarkdownText(text);
