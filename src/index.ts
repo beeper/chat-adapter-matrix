@@ -434,7 +434,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       firstContent,
     );
     for (const content of extraContents) {
-      await this.sendRoomMessage(roomID, rootEventID, replyEventID, content);
+      await this.sendRoomMessage(roomID, rootEventID, undefined, content);
     }
 
     return {
@@ -1297,7 +1297,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
           this.auth.password
         );
 
-    let userID = this.auth.userID ?? loginResponse.user_id;
+    const userID = this.auth.userID ?? loginResponse.user_id;
     if (!userID) {
       throw new Error("Password login succeeded but no user ID was returned.");
     }
@@ -1305,7 +1305,6 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     let authDeviceID = normalizeOptionalString(loginResponse.device_id);
     if (!authDeviceID) {
       const whoami = await this.lookupWhoAmIFromAccessToken(loginResponse.access_token);
-      userID = userID ?? whoami.userID;
       authDeviceID = whoami.deviceID;
     }
 
@@ -1537,12 +1536,9 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
 
           let firstResponse: Awaited<ReturnType<MatrixClient["sendEvent"]>> | undefined;
           for (const splitContent of splitContents) {
-            const response = await this.sendRoomMessage(
-              roomID,
-              rootEventID,
-              replyEventID,
-              splitContent
-            );
+            const chunkWithMeta = this.applyThreadReplyMetadata(splitContent, rootEventID, replyEventID);
+            const response = await this.performSendRoomMessage(roomID, rootEventID, chunkWithMeta);
+            void this.maybePersistSecretsBundle();
             firstResponse ??= response;
           }
 
@@ -1814,7 +1810,9 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
         return;
       }
       this.processedTimelineEventIDs.add(eventID);
-      evictOldestEntries(this.processedTimelineEventIDs);
+      if (this.processedTimelineEventIDs.size > 10_000) {
+        evictOldestEntries(this.processedTimelineEventIDs);
+      }
     }
 
     const roomID = room?.roomId ?? event.getRoomId();
@@ -1943,14 +1941,11 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   }
 
   private async joinRoomWithRetry(roomID: string, maxAttempts = 3): Promise<void> {
-    let lastError: unknown;
-
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       try {
         await this.requireClient().joinRoom(roomID);
         return;
       } catch (error) {
-        lastError = error;
         if (!this.isRetryableJoinError(error) || attempt === maxAttempts) {
           throw error;
         }
@@ -1968,8 +1963,6 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
         );
       }
     }
-
-    throw lastError;
   }
 
   private shouldAcceptInvite(
@@ -2057,7 +2050,9 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
         userID: sender,
       });
 
-      evictOldestEntries(this.reactionByEventID);
+      if (this.reactionByEventID.size > 10_000) {
+        evictOldestEntries(this.reactionByEventID);
+      }
     }
 
     this.requireChat().processReaction({
@@ -2232,7 +2227,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   private parseMatrixHTML(
     html: string
   ): { markdown: string; mentionedUserIDs: Set<string> } {
-    const root = parseHTML(this.stripReplyFallbackFromHTML(html));
+    const root = parseHTML(html);
     const mentionedUserIDs = new Set<string>();
     const markdown = this.normalizeMarkdownSpacing(
       this.renderHTMLNodesToMarkdown(root.childNodes, mentionedUserIDs)
@@ -2420,16 +2415,6 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     }
 
     return lines.slice(index + 1).join("\n");
-  }
-
-  private stripReplyFallbackFromHTML(html: string): string {
-    const root = parseHTML(html);
-    for (const child of [...root.childNodes]) {
-      if (child instanceof HTMLElement && child.tagName.toLowerCase() === "mx-reply") {
-        child.remove();
-      }
-    }
-    return root.toString();
   }
 
   private extractAttachments(content: MatrixMessageContent) {
@@ -2702,7 +2687,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     }
 
     const body = content.body;
-    if (this.utf8ByteLength(body) <= DEFAULT_OVERSIZED_MESSAGE_CHUNK_BYTES) {
+    if (Buffer.byteLength(body, "utf8") <= DEFAULT_OVERSIZED_MESSAGE_CHUNK_BYTES) {
       return [];
     }
 
@@ -2745,7 +2730,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     let remaining = text;
 
     while (remaining.length > 0) {
-      if (this.utf8ByteLength(remaining) <= normalizedMaxBytes) {
+      if (Buffer.byteLength(remaining, "utf8") <= normalizedMaxBytes) {
         chunks.push(remaining);
         remaining = "";
         break;
@@ -2778,7 +2763,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     while (low <= high) {
       const mid = Math.floor((low + high) / 2);
       const candidate = text.slice(0, mid);
-      if (this.utf8ByteLength(candidate) <= maxBytes) {
+      if (Buffer.byteLength(candidate, "utf8") <= maxBytes) {
         best = mid;
         low = mid + 1;
       } else {
@@ -2786,26 +2771,14 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       }
     }
 
-    for (const pattern of [/\n{2,}/gu, /\n/gu, /\s+/gu]) {
-      let match: RegExpExecArray | null = null;
-      let lastBoundary: number | null = null;
-      pattern.lastIndex = 0;
-      while ((match = pattern.exec(text)) !== null) {
-        if (match.index >= best) {
-          break;
-        }
-        lastBoundary = match.index + match[0].length;
-      }
-      if (lastBoundary && lastBoundary > 0) {
-        return lastBoundary;
+    for (let i = best - 1; i > 0; i--) {
+      const ch = text[i];
+      if (ch === "\n" || ch === " " || ch === "\t" || ch === "\r") {
+        return i + 1;
       }
     }
 
     return best;
-  }
-
-  private utf8ByteLength(text: string): number {
-    return Buffer.byteLength(text, "utf8");
   }
 
   private toRoomMessageContent(
@@ -3283,19 +3256,15 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     return `${this.persistenceConfig.keyPrefix}:store`;
   }
 
-  private get sessionBasePrefix(): string {
-    return this.persistenceSessionPrefix;
-  }
-
   private getSessionStorageKey(userID: string): string {
-    return `${this.sessionBasePrefix}:user:${encodeURIComponent(userID)}`;
+    return `${this.persistenceSessionPrefix}:user:${encodeURIComponent(userID)}`;
   }
 
   private getSessionUsernameTemporaryKey(): string | null {
     if (this.auth.type !== "password") {
       return null;
     }
-    return `${this.sessionBasePrefix}:username:${encodeURIComponent(this.auth.username)}`;
+    return `${this.persistenceSessionPrefix}:username:${encodeURIComponent(this.auth.username)}`;
   }
 
   private async loadPersistedSession(): Promise<StoredSession | null> {
@@ -3571,8 +3540,8 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     const setLevel = Reflect.get(matrixSDKLogger, "setLevel");
     if (typeof setLevel === "function") {
       setLevel.call(matrixSDKLogger, numericLevel, false);
+      matrixSDKLogConfigured = true;
     }
-    matrixSDKLogConfigured = true;
   }
 }
 
