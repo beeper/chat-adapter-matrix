@@ -131,13 +131,15 @@ export function splitOversizedTextContent(
 
   const body = content.body;
   if (Buffer.byteLength(body, "utf8") <= DEFAULT_OVERSIZED_MESSAGE_CHUNK_BYTES) {
-    return [];
+    return [
+      {
+        body,
+        msgtype: content.msgtype,
+      },
+    ];
   }
 
   const parts = splitTextByUtf8Bytes(body, DEFAULT_OVERSIZED_MESSAGE_CHUNK_BYTES);
-  if (parts.length <= 1) {
-    return [];
-  }
 
   return parts.map((part) => ({
     body: part,
@@ -520,10 +522,8 @@ function splitTextByUtf8Bytes(text: string, maxBytes: number): string[] {
       remaining,
       findSplitBoundary(remaining, normalizedMaxBytes)
     );
-    const rawHead = remaining.slice(0, boundary);
-    const rawTail = remaining.slice(boundary);
-    const head = trimEndPreservingSurrogates(rawHead);
-    const tail = trimStartPreservingSurrogates(rawTail);
+    const head = remaining.slice(0, boundary);
+    const tail = remaining.slice(boundary);
 
     if (!head || head === remaining) {
       break;
@@ -564,22 +564,6 @@ function findSplitBoundary(text: string, maxBytes: number): number {
   }
 
   return clampSurrogateBoundary(text, best);
-}
-
-function trimEndPreservingSurrogates(text: string): string {
-  let boundary = text.length;
-  while (boundary > 0 && /\s/.test(text[boundary - 1] ?? "")) {
-    boundary -= 1;
-  }
-  return text.slice(0, clampSurrogateBoundary(text, boundary));
-}
-
-function trimStartPreservingSurrogates(text: string): string {
-  let boundary = 0;
-  while (boundary < text.length && /\s/.test(text[boundary] ?? "")) {
-    boundary += 1;
-  }
-  return text.slice(clampSurrogateBoundary(text, boundary));
 }
 
 function clampSurrogateBoundary(text: string, boundary: number): number {

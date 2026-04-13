@@ -690,6 +690,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     options: ListThreadsOptions = {}
   ): Promise<ListThreadsResult<MatrixEvent>> {
     const roomID = this.decodeThreadId(channelId).roomID;
+    const room = this.requireRoom(roomID);
     const limit = options.limit ?? 50;
     const cursor = options.cursor
       ? decodeCursorV1(options.cursor, "thread_list", roomID, undefined, "backward")
@@ -702,6 +703,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       ThreadFilterType.All
     );
     const events = await this.mapRawEvents(listResponse.chunk ?? [], roomID);
+    room.processThreadRoots(events, true);
     const summaries: ThreadSummary<MatrixEvent>[] = [];
 
     for (const rootEvent of events) {
@@ -710,16 +712,32 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
         continue;
       }
 
-      const bundled = rootEvent.getServerAggregatedRelation<IThreadBundledRelationship>(
-        THREAD_RELATION_TYPE.name
-      );
-      const latestTS = bundled?.latest_event?.origin_server_ts;
+      const localRootEvent = room.findEventById(rootID);
+      const summaryRootEvent = localRootEvent ?? rootEvent;
+      const bundled =
+        summaryRootEvent.getServerAggregatedRelation<IThreadBundledRelationship>(
+          THREAD_RELATION_TYPE.name
+        ) ??
+        rootEvent.getServerAggregatedRelation<IThreadBundledRelationship>(
+          THREAD_RELATION_TYPE.name
+        );
+      const roomThread = room.getThread(rootID);
+      const latestReply = roomThread?.replyToEvent;
+      let latestTS = latestReply?.getTs() ?? bundled?.latest_event?.origin_server_ts;
+      let replyCount = Math.max(roomThread?.length ?? 0, bundled?.count ?? 0);
+
+      if (replyCount === 0 && typeof latestTS !== "number") {
+        const fallback = await this.fetchLatestThreadReplySummary(roomID, rootID);
+        replyCount = Math.max(replyCount, fallback.replyCount);
+        latestTS = latestTS ?? fallback.latestReplyTS;
+      }
+
       const threadID = this.encodeThreadId({ roomID, rootEventID: rootID });
 
       summaries.push({
         id: threadID,
-        rootMessage: this.parseMessageInternal(rootEvent, threadID),
-        replyCount: bundled?.count ?? 0,
+        rootMessage: this.parseMessageInternal(summaryRootEvent, threadID),
+        replyCount,
         lastReplyAt: typeof latestTS === "number" ? new Date(latestTS) : undefined,
       });
     }
@@ -735,6 +753,28 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
           })
         : undefined,
     };
+  }
+
+  private async fetchLatestThreadReplySummary(
+    roomID: string,
+    rootEventID: string
+  ): Promise<{ replyCount: number; latestReplyTS?: number }> {
+    const response = await this.fetchThreadMessagesPage({
+      roomID,
+      rootEventID,
+      includeRoot: false,
+      limit: 1,
+      direction: "backward",
+      fromToken: null,
+    });
+    const latestReply = response.events.at(-1);
+
+    return latestReply
+      ? {
+          replyCount: 1,
+          latestReplyTS: latestReply.getTs(),
+        }
+      : { replyCount: 0 };
   }
 
   private parseMessageInternal(
@@ -1409,7 +1449,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
     } catch (error) {
       if (isTooLargeMatrixError(error)) {
         const splitContents = splitOversizedTextContent(threadContent);
-        if (splitContents.length > 1) {
+        if (splitContents.length > 0) {
           this.logger.warn(
             "Matrix message exceeded size limit; retrying as split plain-text chunks",
             {

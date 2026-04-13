@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { Chat, type Message, type ReactionEvent, type StateAdapter } from "chat";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { createRedisState } from "@chat-adapter/state-redis";
+import "fake-indexeddb/auto";
 import { EventType } from "matrix-js-sdk";
 import type { MatrixClient, MatrixEvent, Room } from "matrix-js-sdk";
 import { MatrixAdapter } from "../src/index";
@@ -61,6 +62,7 @@ export async function createParticipantFromSession(opts: {
   state?: StateAdapter;
 }): Promise<E2EParticipant> {
   const state = opts.state ?? createE2EState(opts.name);
+  const cryptoDatabasePrefix = createE2EIndexedDBPrefix(opts.session);
   const adapter = new MatrixAdapter({
     baseURL: env.baseURL,
     auth: {
@@ -71,7 +73,8 @@ export async function createParticipantFromSession(opts: {
     deviceID: opts.session.deviceID,
     inviteAutoJoin: {},
     e2ee: {
-      useIndexedDB: false,
+      cryptoDatabasePrefix,
+      useIndexedDB: true,
     },
     recoveryKey: opts.recoveryKey,
   });
@@ -135,6 +138,14 @@ type MatrixLoginResponse = {
   deviceID: string;
   userID: string;
 };
+
+function createE2EIndexedDBPrefix(session: MatrixLoginResponse): string {
+  return `matrix-chat-adapter-e2e-${sanitizeForIndexedDBName(session.userID)}-${sanitizeForIndexedDBName(session.deviceID)}`;
+}
+
+function sanitizeForIndexedDBName(value: string): string {
+  return value.replace(/[^a-zA-Z0-9_-]+/gu, "_");
+}
 
 function generateDeviceID(): string {
   return `E2E_${randomBytes(8).toString("hex").toUpperCase()}`;
@@ -283,14 +294,14 @@ export function waitForEvent<T>(
 }
 
 export async function waitForCondition(
-  condition: () => boolean,
+  condition: () => boolean | Promise<boolean>,
   timeoutMs = 10_000,
   intervalMs = 250
 ): Promise<void> {
   const startedAt = Date.now();
 
   while (true) {
-    if (condition()) {
+    if (await condition()) {
       return;
     }
 

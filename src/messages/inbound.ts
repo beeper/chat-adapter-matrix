@@ -86,13 +86,18 @@ export function isMentioned(args: {
   const hasMatrixTo = userID
     ? formatted.includes(`matrix.to/#/${encodeURIComponent(userID)}`)
     : false;
-
-  const usernameMention = userName.startsWith("@")
-    ? userName
-    : `@${userName}`;
-
-  const hasUserName =
-    parsed.text.includes(usernameMention) || formatted.includes(usernameMention);
+  const normalizedUserName = userName.trim();
+  const hasUserName = normalizedUserName
+    ? (() => {
+        const usernameMention = normalizedUserName.startsWith("@")
+          ? normalizedUserName
+          : `@${normalizedUserName}`;
+        return (
+          parsed.text.includes(usernameMention) ||
+          formatted.includes(usernameMention)
+        );
+      })()
+    : false;
 
   return hasUserID || hasMatrixTo || hasUserName;
 }
