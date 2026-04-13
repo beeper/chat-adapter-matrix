@@ -11,6 +11,7 @@ import {
   nonce,
   shutdownParticipant,
   sleep,
+  waitForCondition,
   waitForEvent,
   waitForEncryptedRoom,
   waitForFetchedMessage,
@@ -470,11 +471,11 @@ describe.skipIf(!hasCoreCredentials)("E2E Matrix Adapter", () => {
     ]);
 
     const latestOffline = offlinePosts[offlinePosts.length - 1];
-    const caughtUpMessage = await waitForFetchedMessage(
+    const caughtUpMessage = await waitForMatchingMessage(
       bot.adapter,
       bot.adapter.encodeThreadId({ roomID: restartRoomID }),
-      latestOffline.id,
-      (message) => message.text.includes(restartTag),
+      (message) =>
+        message.id === latestOffline.id && message.text.includes(restartTag),
       60_000
     );
     expect(caughtUpMessage.text).toContain(restartTag);
@@ -626,11 +627,10 @@ describe.skipIf(!hasCoreCredentials)("E2E Matrix Adapter", () => {
     });
     await sender.adapter.postMessage(threadId, `Thread reply ${replyTag}`);
 
-    await waitForFetchedMessage(
+    await waitForMatchingMessage(
       bot.adapter,
       bot.adapter.encodeThreadId({ roomID: threadListRoomID }),
-      rootPosted.id,
-      (message) => message.text.includes(rootTag)
+      (message) => message.id === rootPosted.id && message.text.includes(rootTag)
     );
     await waitForMatchingMessage(
       bot.adapter,
@@ -653,8 +653,15 @@ describe.skipIf(!hasCoreCredentials)("E2E Matrix Adapter", () => {
     expect(threadInfo.isDM).toBe(false);
     expect(threadInfo.metadata?.roomID).toBe(threadListRoomID);
 
-    const threads = await bot.adapter.listThreads(channelId, { limit: 20 });
-    const summary = threads.threads.find((thread) => thread.id === threadId);
+    let summary:
+      | Awaited<ReturnType<typeof bot.adapter.listThreads>>["threads"][number]
+      | undefined;
+    await waitForCondition(async () => {
+      const threads = await bot.adapter.listThreads(channelId, { limit: 20 });
+      summary = threads.threads.find((thread) => thread.id === threadId);
+      return Boolean(summary && (summary.replyCount ?? 0) >= 1);
+    }, 45_000);
+
     expect(summary).toBeTruthy();
     expect(summary?.rootMessage.id).toBe(rootPosted.id);
     expect(summary?.rootMessage.text).toContain(rootTag);

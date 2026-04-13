@@ -1,11 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import { Chat, getEmoji, stringifyMarkdown } from "chat";
-import type { ChatInstance, Logger, StateAdapter } from "chat";
+import type { AdapterPostableMessage, ChatInstance, Logger, StateAdapter } from "chat";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { EventType, MsgType, RelationType, type MatrixClient } from "matrix-js-sdk";
 import { MatrixError } from "matrix-js-sdk/lib/http-api/errors";
 import { encodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key";
 import { createMatrixAdapter, MatrixAdapter } from "./index";
+import { isMentioned } from "./messages/inbound";
+import { splitOversizedTextContent } from "./messages/outbound";
 
 type RawEventLike = {
   content?: Record<string, unknown>;
@@ -48,6 +50,9 @@ type RoomStateLike = {
 type RoomLike = {
   currentState: RoomStateLike;
   getMember: (userId: string) => MemberLike | null;
+  getThread: (eventId: string) => { length: number; replyToEvent: ReturnType<typeof makeEvent> | null } | null;
+  getThreads: () => Array<{ id: string }>;
+  processThreadRoots: (events: Array<ReturnType<typeof makeEvent>>, toStartOfTimeline: boolean) => void;
   roomId: string;
   name: string;
   timeline: unknown[];
@@ -272,6 +277,9 @@ function makeRoom(overrides: Partial<RoomLike> = {}): RoomLike {
       getStateEvents: () => null,
     },
     getMember: () => null,
+    getThread: () => null,
+    getThreads: () => [],
+    processThreadRoots: () => undefined,
     hasEncryptionStateEvent: () => false,
     getJoinedMembers: () => [{}, {}],
     getMyMembership: () => "join",
@@ -310,6 +318,8 @@ function makeStateAdapter(initial: Record<string, unknown> = {}): StateAdapter {
     return run();
   };
   const get: StateAdapter["get"] = (key) => afterReady(() => base.get(key));
+  const getList: StateAdapter["getList"] = (key) =>
+    afterReady(() => base.getList(key));
   const set: StateAdapter["set"] = (key, value, ttlMs) =>
     afterReady(() => base.set(key, value, ttlMs));
   const setIfNotExists: StateAdapter["setIfNotExists"] = (key, value, ttlMs) =>
@@ -319,14 +329,26 @@ function makeStateAdapter(initial: Record<string, unknown> = {}): StateAdapter {
     acquireLock: vi.fn((threadId, ttlMs) =>
       afterReady(() => base.acquireLock(threadId, ttlMs))
     ),
+    appendToList: vi.fn((key, value, options) =>
+      afterReady(() => base.appendToList(key, value, options))
+    ),
     connect: vi.fn(connect),
     delete: vi.fn((key) => afterReady(() => base.delete(key))),
+    dequeue: vi.fn((threadId) => afterReady(() => base.dequeue(threadId))),
     disconnect: vi.fn(() => afterReady(() => base.disconnect())),
+    enqueue: vi.fn((threadId, entry, maxSize) =>
+      afterReady(() => base.enqueue(threadId, entry, maxSize))
+    ),
     extendLock: vi.fn((lock, ttlMs) =>
       afterReady(() => base.extendLock(lock, ttlMs))
     ),
+    forceReleaseLock: vi.fn((threadId) =>
+      afterReady(() => base.forceReleaseLock(threadId))
+    ),
     get,
+    getList,
     isSubscribed: vi.fn((threadId) => afterReady(() => base.isSubscribed(threadId))),
+    queueDepth: vi.fn((threadId) => afterReady(() => base.queueDepth(threadId))),
     releaseLock: vi.fn((lock) => afterReady(() => base.releaseLock(lock))),
     set: vi.fn(set),
     setIfNotExists: vi.fn(setIfNotExists),
@@ -433,6 +455,21 @@ describe("MatrixAdapter", () => {
       roomID: "!room:beeper.com",
       rootEventID: "$root:beeper.com",
     });
+  });
+
+  it("rejects thread IDs with an empty room ID", () => {
+    const adapter = new MatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: {
+        type: "accessToken",
+        accessToken: "token",
+        userID: "@bot:beeper.com",
+      },
+    });
+
+    expect(() => adapter.decodeThreadId("matrix:")).toThrow(
+      "Invalid Matrix thread ID: matrix:"
+    );
   });
 
   it("parses slash commands from timeline messages", async () => {
@@ -935,6 +972,62 @@ describe("MatrixAdapter", () => {
     });
   });
 
+  it("escapes HTML anchor text before re-emitting markdown links", async () => {
+    const fakeClient = makeClient();
+    fakeClient.fetchRoomEvent = vi.fn(async () =>
+      makeRawEvent({
+        event_id: "$escaped-link",
+        content: {
+          body: "literal [text](https://example.com)",
+          msgtype: MsgType.Text,
+          format: "org.matrix.custom.html",
+          formatted_body:
+            '<p><a href="https://example.com">Docs [v1] (draft) \\\\ notes</a></p>',
+        },
+      })
+    );
+
+    const adapter = await makeInitializedAdapter(fakeClient);
+    const message = await adapter.fetchMessage(
+      "matrix:!room%3Abeeper.com",
+      "$escaped-link"
+    );
+
+    expect(message).toBeTruthy();
+    expect(
+      stringifyMarkdown(requireValue(message, "escaped link message").formatted).trim()
+    ).toBe("\\[Docs [v1\\] (draft) \\\\\\ notes](https://example.com)");
+  });
+
+  it("ignores malformed matrix.to links instead of aborting formatted-body parsing", async () => {
+    const fakeClient = makeClient();
+    fakeClient.fetchRoomEvent = vi.fn(async () =>
+      makeRawEvent({
+        event_id: "$bad-matrix-to",
+        content: {
+          body: "Broken mention link",
+          msgtype: MsgType.Text,
+          format: "org.matrix.custom.html",
+          formatted_body:
+            '<p><a href="https://matrix.to/#/%E0%A4%A">broken]</a> <strong>still parsed</strong></p>',
+        },
+      })
+    );
+
+    const adapter = await makeInitializedAdapter(fakeClient);
+    const message = await adapter.fetchMessage(
+      "matrix:!room%3Abeeper.com",
+      "$bad-matrix-to"
+    );
+
+    expect(message).toBeTruthy();
+    expect(message?.text).toBe("broken] still parsed");
+    expect(
+      stringifyMarkdown(requireValue(message, "bad matrix.to message").formatted).trim()
+    ).toBe("[broken\\]](https://matrix.to/#/%E0%A4%A) **still parsed**");
+    expect(message?.isMention).toBe(false);
+  });
+
   it("strips Matrix reply fallback from plain body text", async () => {
     const fakeClient = makeClient();
     fakeClient.fetchRoomEvent = vi.fn(async () =>
@@ -1069,6 +1162,53 @@ describe("MatrixAdapter", () => {
     expect(channel.metadata).toMatchObject(thread.metadata ?? {});
   });
 
+  it("adds reply fallback metadata when posting to a Matrix thread", async () => {
+    const fakeClient = makeClient();
+    const adapter = await makeInitializedAdapter(fakeClient);
+
+    await adapter.postMessage("matrix:!room%3Abeeper.com:%24root", "hello");
+
+    expect(fakeClient.sendEvent).toHaveBeenCalledWith(
+      "!room:beeper.com",
+      "$root",
+      EventType.RoomMessage,
+      expect.objectContaining({
+        body: "hello",
+        msgtype: MsgType.Text,
+        "m.relates_to": {
+          "m.in_reply_to": {
+            event_id: "$root",
+          },
+        },
+      })
+    );
+  });
+
+  it("uses an explicit reply target when posting within a Matrix thread", async () => {
+    const fakeClient = makeClient();
+    const adapter = await makeInitializedAdapter(fakeClient);
+
+    await adapter.postMessage("matrix:!room%3Abeeper.com:%24root", {
+      raw: "hello",
+      matrixReplyToEventId: "$reply",
+    } as AdapterPostableMessage);
+
+    expect(fakeClient.sendEvent).toHaveBeenCalledWith(
+      "!room:beeper.com",
+      "$root",
+      EventType.RoomMessage,
+      expect.objectContaining({
+        body: "hello",
+        msgtype: MsgType.Text,
+        "m.relates_to": {
+          "m.in_reply_to": {
+            event_id: "$reply",
+          },
+        },
+      })
+    );
+  });
+
   it("uploads file payloads and posts Matrix media events", async () => {
     const fakeClient = makeClient();
     fakeClient.sendEvent = vi
@@ -1118,6 +1258,43 @@ describe("MatrixAdapter", () => {
         url: "mxc://beeper.com/file-1",
       })
     );
+  });
+
+  it("omits reply fallback metadata for follow-up attachments in Matrix threads", async () => {
+    const fakeClient = makeClient();
+    fakeClient.sendEvent = vi
+      .fn()
+      .mockResolvedValueOnce({ event_id: "$text" })
+      .mockResolvedValueOnce({ event_id: "$file" });
+    fakeClient.uploadContent = vi
+      .fn()
+      .mockResolvedValueOnce({ content_uri: "mxc://beeper.com/file-1" });
+
+    const adapter = await makeInitializedAdapter(fakeClient);
+
+    await adapter.postMessage("matrix:!room%3Abeeper.com:%24root", {
+      markdown: "File incoming",
+      files: [
+        {
+          data: new Uint8Array([1, 2, 3]).buffer,
+          filename: "report.png",
+          mimeType: "image/png",
+        },
+      ],
+    });
+
+    const sendCalls = fakeClient.sendEvent.mock.calls as unknown as Array<unknown[]>;
+    const firstContent = sendCalls[0]?.[3] as Record<string, unknown>;
+    const secondContent = sendCalls[1]?.[3] as Record<string, unknown>;
+
+    expect(firstContent).toMatchObject({
+      "m.relates_to": {
+        "m.in_reply_to": {
+          event_id: "$root",
+        },
+      },
+    });
+    expect(secondContent).not.toHaveProperty("m.relates_to");
   });
 
   it("skips invalid file uploads instead of passing malformed entries downstream", async () => {
@@ -1199,6 +1376,182 @@ describe("MatrixAdapter", () => {
     );
   });
 
+  it("retries oversized rich-text events as split plain-text messages", async () => {
+    const fakeClient = makeClient();
+    const logger = makeTestLogger();
+    const tooLargeError = new MatrixError(
+      { errcode: "M_TOO_LARGE", error: "event too large" },
+      413
+    );
+    fakeClient.getRoom.mockReturnValue(
+      makeRoom({
+        findEventById: () => null,
+      })
+    );
+    fakeClient.sendEvent = vi
+      .fn()
+      .mockRejectedValueOnce(tooLargeError)
+      .mockResolvedValueOnce({ event_id: "$chunk-1" })
+      .mockResolvedValueOnce({ event_id: "$chunk-2" });
+
+    const adapter = new MatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: {
+        type: "accessToken",
+        accessToken: "token",
+        userID: "@bot:beeper.com",
+      },
+      logger: logger.logger,
+      createClient: () => asMatrixClient(fakeClient),
+    });
+    await adapter.initialize(makeChatInstance());
+
+    const repeatedMarkdown = Array.from({ length: 2_000 }, () => "**hello** `world`").join("\n");
+    const sent = await adapter.postMessage("matrix:!room%3Abeeper.com", {
+      markdown: repeatedMarkdown,
+    });
+
+    expect(sent.id).toBe("$chunk-1");
+    expect(fakeClient.sendEvent).toHaveBeenCalledTimes(3);
+    expect(fakeClient.sendEvent).toHaveBeenNthCalledWith(
+      1,
+      "!room:beeper.com",
+      EventType.RoomMessage,
+      expect.objectContaining({
+        format: "org.matrix.custom.html",
+        formatted_body: expect.any(String),
+      })
+    );
+
+    const fallbackBodies = (fakeClient.sendEvent.mock.calls as unknown as Array<unknown[]>)
+      .slice(1)
+      .map((call) => call[2] as unknown as Record<string, unknown>);
+    expect(fallbackBodies).toHaveLength(2);
+    expect(fallbackBodies.map((content) => content.body).join(""))
+      .toBe(Array.from({ length: 2_000 }, () => "hello world").join("\n"));
+    for (const content of fallbackBodies) {
+      expect(content).toMatchObject({ msgtype: MsgType.Text });
+      expect(content).not.toHaveProperty("format");
+      expect(content).not.toHaveProperty("formatted_body");
+      expect(content).not.toHaveProperty("m.mentions");
+    }
+    expect(sent.raw.getContent()).toMatchObject(fallbackBodies[0] ?? {});
+
+    expect(logger.warn).toHaveBeenCalledWith(
+      "Matrix message exceeded size limit; retrying as split plain-text chunks",
+      expect.objectContaining({
+        roomId: "!room:beeper.com",
+        chunkCount: 2,
+        msgtype: MsgType.Text,
+      })
+    );
+    expect(logger.error).not.toHaveBeenCalled();
+  });
+
+  it("retries oversized rich-text events as a single plain-text fallback when body fits", async () => {
+    const fakeClient = makeClient();
+    const logger = makeTestLogger();
+    const tooLargeError = new MatrixError(
+      { errcode: "M_TOO_LARGE", error: "event too large" },
+      413
+    );
+    fakeClient.getRoom.mockReturnValue(
+      makeRoom({
+        findEventById: () => null,
+      })
+    );
+    fakeClient.sendEvent = vi
+      .fn()
+      .mockRejectedValueOnce(tooLargeError)
+      .mockResolvedValueOnce({ event_id: "$plain-fallback" });
+
+    const adapter = new MatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: {
+        type: "accessToken",
+        accessToken: "token",
+        userID: "@bot:beeper.com",
+      },
+      logger: logger.logger,
+      createClient: () => asMatrixClient(fakeClient),
+    });
+    await adapter.initialize(makeChatInstance());
+
+    const sent = await adapter.postMessage("matrix:!room%3Abeeper.com", {
+      markdown: "**hello**",
+    });
+
+    expect(sent.id).toBe("$plain-fallback");
+    expect(fakeClient.sendEvent).toHaveBeenCalledTimes(2);
+    expect(fakeClient.sendEvent).toHaveBeenNthCalledWith(
+      2,
+      "!room:beeper.com",
+      EventType.RoomMessage,
+      expect.objectContaining({
+        body: "hello",
+        msgtype: MsgType.Text,
+      })
+    );
+
+    const fallbackCalls = fakeClient.sendEvent.mock.calls as unknown as Array<unknown[]>;
+    const fallbackContent = fallbackCalls[1]?.[2] as Record<string, unknown> | undefined;
+    expect(fallbackContent).not.toHaveProperty("format");
+    expect(fallbackContent).not.toHaveProperty("formatted_body");
+    expect(fallbackContent).not.toHaveProperty("m.mentions");
+    expect(sent.raw.getContent()).toMatchObject(fallbackContent ?? {});
+
+    expect(logger.warn).toHaveBeenCalledWith(
+      "Matrix message exceeded size limit; retrying as split plain-text chunks",
+      expect.objectContaining({
+        roomId: "!room:beeper.com",
+        chunkCount: 1,
+        msgtype: MsgType.Text,
+      })
+    );
+  });
+
+  it("rethrows M_TOO_LARGE for non-text Matrix events", async () => {
+    const fakeClient = makeClient();
+    const logger = makeTestLogger();
+    const tooLargeError = new MatrixError(
+      { errcode: "M_TOO_LARGE", error: "event too large" },
+      413
+    );
+    fakeClient.sendEvent = vi.fn().mockRejectedValue(tooLargeError);
+
+    const adapter = new MatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: {
+        type: "accessToken",
+        accessToken: "token",
+        userID: "@bot:beeper.com",
+      },
+      logger: logger.logger,
+      createClient: () => asMatrixClient(fakeClient),
+    });
+    await adapter.initialize(makeChatInstance());
+
+    await expect(
+      adapter.postMessage("matrix:!room%3Abeeper.com", {
+        files: [
+          {
+            data: new Uint8Array([1, 2, 3]).buffer,
+            filename: "report.png",
+            mimeType: "image/png",
+          },
+        ],
+      } as AdapterPostableMessage)
+    ).rejects.toBe(tooLargeError);
+    expect(logger.error).toHaveBeenCalledWith(
+      "Matrix send message failed",
+      expect.objectContaining({
+        roomId: "!room:beeper.com",
+        msgtype: MsgType.Image,
+        error: tooLargeError,
+      })
+    );
+  });
+
   it("logs and rethrows Matrix upload failures", async () => {
     const fakeClient = makeClient();
     const logger = makeTestLogger();
@@ -1275,6 +1628,54 @@ describe("MatrixAdapter", () => {
         body: "See attachment\n\nspec: https://example.com/spec.pdf",
       })
     );
+  });
+
+  it("splits oversized text without cutting surrogate pairs", () => {
+    const content = splitOversizedTextContent({
+      body: "😀".repeat(4_000),
+      msgtype: MsgType.Text,
+    });
+
+    expect(content.length).toBeGreaterThan(1);
+    expect(content.map((part) => part.body).join("")).toBe("😀".repeat(4_000));
+
+    for (const part of content) {
+      const body = part.body;
+      const lastCodeUnit = body.charCodeAt(body.length - 1);
+      const firstCodeUnit = body.charCodeAt(0);
+      expect(lastCodeUnit < 0xd800 || lastCodeUnit > 0xdbff).toBe(true);
+      expect(firstCodeUnit < 0xdc00 || firstCodeUnit > 0xdfff).toBe(true);
+    }
+  });
+
+  it("preserves boundary whitespace when splitting oversized text", () => {
+    const text = `${"a".repeat(11_999)} ${"b".repeat(32)}`;
+    const content = splitOversizedTextContent({
+      body: text,
+      msgtype: MsgType.Text,
+    });
+
+    expect(content.length).toBeGreaterThan(1);
+    expect(content.map((part) => part.body).join("")).toBe(text);
+  });
+
+  it("does not treat an empty username as a mention", () => {
+    expect(
+      isMentioned({
+        content: {
+          body: "@someone said hi",
+          msgtype: MsgType.Text,
+        },
+        parsed: {
+          markdown: "@someone said hi",
+          mentionedUserIDs: new Set<string>(),
+          mentionsRoom: false,
+          text: "@someone said hi",
+        },
+        userID: "",
+        userName: "",
+      })
+    ).toBe(false);
   });
 
   it("generates and persists a device id when one is not provided", async () => {
@@ -2350,5 +2751,177 @@ describe("MatrixAdapter", () => {
       roomID: "!room:beeper.com",
       dir: "backward",
     });
+  });
+
+  it("prefers live room thread metadata when bundled thread counts lag", async () => {
+    const fakeClient = makeClient();
+    fakeClient.createThreadListMessagesRequest.mockResolvedValue({
+      chunk: [
+        makeRawEvent({
+          event_id: "$root1",
+          origin_server_ts: 1_700_000_000_100,
+          content: { body: "Root 1" },
+          unsigned: {
+            "m.relations": {
+              "m.thread": {
+                count: 0,
+                latest_event: { origin_server_ts: 1_700_000_000_500 },
+              },
+            },
+          },
+        }),
+      ],
+      end: undefined,
+    });
+
+    const latestReply = makeEvent({
+      getId: () => "$reply1",
+      getTs: () => 1_700_000_000_900,
+    });
+    fakeClient.getRoom.mockReturnValue(
+      makeRoom({
+        getThread: (eventId: string) =>
+          eventId === "$root1"
+            ? {
+                length: 2,
+                replyToEvent: latestReply,
+              }
+            : null,
+      })
+    );
+
+    const adapter = await makeInitializedAdapter(fakeClient);
+
+    const result = await adapter.listThreads("matrix:!room%3Abeeper.com", { limit: 2 });
+
+    expect(result.threads).toHaveLength(1);
+    expect(result.threads[0]?.replyCount).toBe(2);
+    expect(result.threads[0]?.lastReplyAt?.toISOString()).toBe(
+      "2023-11-14T22:13:20.900Z"
+    );
+  });
+
+  it("hydrates room thread metadata from thread-list roots before summarizing", async () => {
+    const fakeClient = makeClient();
+    fakeClient.createThreadListMessagesRequest.mockResolvedValue({
+      chunk: [
+        makeRawEvent({
+          event_id: "$root1",
+          origin_server_ts: 1_700_000_000_100,
+          content: { body: "Root 1" },
+          unsigned: {
+            "m.relations": {
+              "m.thread": {
+                count: 0,
+                latest_event: { origin_server_ts: 1_700_000_000_500 },
+              },
+            },
+          },
+        }),
+      ],
+      end: undefined,
+    });
+
+    const latestReply = makeEvent({
+      getId: () => "$reply1",
+      getTs: () => 1_700_000_000_900,
+    });
+    let hydrated = false;
+    const processThreadRoots = vi.fn(
+      (events: Array<ReturnType<typeof makeEvent>>, toStartOfTimeline: boolean) => {
+        expect(events.map((event) => event.getId())).toEqual(["$root1"]);
+        expect(toStartOfTimeline).toBe(true);
+        hydrated = true;
+      }
+    );
+    fakeClient.getRoom.mockReturnValue(
+      makeRoom({
+        processThreadRoots,
+        getThread: (eventId: string) =>
+          hydrated && eventId === "$root1"
+            ? {
+                length: 1,
+                replyToEvent: latestReply,
+              }
+            : null,
+      })
+    );
+
+    const adapter = await makeInitializedAdapter(fakeClient);
+
+    const result = await adapter.listThreads("matrix:!room%3Abeeper.com", { limit: 2 });
+
+    expect(processThreadRoots).toHaveBeenCalledOnce();
+    expect(result.threads).toHaveLength(1);
+    expect(result.threads[0]?.replyCount).toBe(1);
+    expect(result.threads[0]?.lastReplyAt?.toISOString()).toBe(
+      "2023-11-14T22:13:20.900Z"
+    );
+  });
+
+  it("falls back to fetching the latest thread reply when thread summaries are missing", async () => {
+    const fakeClient = makeClient();
+    fakeClient.createThreadListMessagesRequest.mockResolvedValue({
+      chunk: [
+        makeRawEvent({
+          event_id: "$root1",
+          origin_server_ts: 1_700_000_000_100,
+          content: { body: "Root 1" },
+          unsigned: {},
+        }),
+      ],
+      end: undefined,
+    });
+    fakeClient.relations.mockResolvedValue({
+      originalEvent: null,
+      events: [
+        makeEvent({
+          getId: () => "$reply1",
+          getTs: () => 1_700_000_000_900,
+          getContent: () => ({ body: "Reply 1" }),
+          getRelation: () => ({
+            rel_type: RelationType.Thread,
+            event_id: "$root1",
+          }),
+          isRelation: (relType?: string) => relType === RelationType.Thread,
+          threadRootId: "$root1",
+        }),
+      ],
+      nextBatch: null,
+      prevBatch: null,
+    });
+    fakeClient.getRoom.mockReturnValue(
+      makeRoom({
+        findEventById: (eventId?: string) =>
+          eventId === "$root1"
+            ? makeEvent({
+                getId: () => "$root1",
+                getTs: () => 1_700_000_000_100,
+                getContent: () => ({ body: "Root 1" }),
+              })
+            : null,
+      })
+    );
+
+    const adapter = await makeInitializedAdapter(fakeClient);
+
+    const result = await adapter.listThreads("matrix:!room%3Abeeper.com", { limit: 2 });
+
+    expect(fakeClient.relations).toHaveBeenCalledWith(
+      "!room:beeper.com",
+      "$root1",
+      "m.thread",
+      null,
+      {
+        dir: "b",
+        from: undefined,
+        limit: 1,
+      }
+    );
+    expect(result.threads).toHaveLength(1);
+    expect(result.threads[0]?.replyCount).toBe(1);
+    expect(result.threads[0]?.lastReplyAt?.toISOString()).toBe(
+      "2023-11-14T22:13:20.900Z"
+    );
   });
 });

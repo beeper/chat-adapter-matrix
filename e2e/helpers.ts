@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 import { Chat, type Message, type ReactionEvent, type StateAdapter } from "chat";
 import { createMemoryState } from "@chat-adapter/state-memory";
 import { createRedisState } from "@chat-adapter/state-redis";
+import "fake-indexeddb/auto";
 import { EventType } from "matrix-js-sdk";
 import type { MatrixClient, MatrixEvent, Room } from "matrix-js-sdk";
 import { MatrixAdapter } from "../src/index";
@@ -61,6 +62,7 @@ export async function createParticipantFromSession(opts: {
   state?: StateAdapter;
 }): Promise<E2EParticipant> {
   const state = opts.state ?? createE2EState(opts.name);
+  const cryptoDatabasePrefix = createE2EIndexedDBPrefix(opts.session);
   const adapter = new MatrixAdapter({
     baseURL: env.baseURL,
     auth: {
@@ -71,7 +73,8 @@ export async function createParticipantFromSession(opts: {
     deviceID: opts.session.deviceID,
     inviteAutoJoin: {},
     e2ee: {
-      useIndexedDB: false,
+      cryptoDatabasePrefix,
+      useIndexedDB: true,
     },
     recoveryKey: opts.recoveryKey,
   });
@@ -135,6 +138,14 @@ type MatrixLoginResponse = {
   deviceID: string;
   userID: string;
 };
+
+function createE2EIndexedDBPrefix(session: MatrixLoginResponse): string {
+  return `matrix-chat-adapter-e2e-${encodeForIndexedDBName(session.userID)}-${encodeForIndexedDBName(session.deviceID)}`;
+}
+
+function encodeForIndexedDBName(value: string): string {
+  return Buffer.from(value, "utf8").toString("base64url");
+}
 
 function generateDeviceID(): string {
   return `E2E_${randomBytes(8).toString("hex").toUpperCase()}`;
@@ -283,15 +294,37 @@ export function waitForEvent<T>(
 }
 
 export async function waitForCondition(
-  condition: () => boolean,
+  condition: () => boolean | Promise<boolean>,
   timeoutMs = 10_000,
   intervalMs = 250
 ): Promise<void> {
   const startedAt = Date.now();
 
   while (true) {
-    if (condition()) {
-      return;
+    const remainingMs = timeoutMs - (Date.now() - startedAt);
+    if (remainingMs <= 0) {
+      throw new Error(`waitForCondition timed out after ${timeoutMs}ms`);
+    }
+
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const matched = await Promise.race([
+        Promise.resolve().then(condition),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => {
+            reject(new Error(`waitForCondition timed out after ${timeoutMs}ms`));
+          }, remainingMs);
+          timeout.unref?.();
+        }),
+      ]);
+
+      if (matched) {
+        return;
+      }
+    } finally {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
     }
 
     if (Date.now() - startedAt >= timeoutMs) {
