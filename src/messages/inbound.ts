@@ -7,6 +7,7 @@ import {
   type Node as HTMLNode,
 } from "node-html-parser";
 import {
+  escapeMarkdownLinkText,
   escapeMarkdownText,
   isRecord,
   matrixMentionDisplayText,
@@ -240,7 +241,7 @@ function renderHTMLLinkToMarkdown(
     return text || matrixMentionDisplayText(mentionedUserID);
   }
 
-  return `[${text || href}](${href})`;
+  return `[${escapeMarkdownLinkText(text || href)}](${href})`;
 }
 
 function parseMatrixToUserID(href: string): string | null {
@@ -261,8 +262,12 @@ function parseMatrixToUserID(href: string): string | null {
     return null;
   }
 
-  const identifier = decodeURIComponent(firstSegment);
-  return identifier.startsWith("@") ? identifier : null;
+  try {
+    const identifier = decodeURIComponent(firstSegment);
+    return identifier.startsWith("@") ? identifier : null;
+  } catch {
+    return null;
+  }
 }
 
 function extractMentionedUserIDs(content: MatrixMessageContent): Set<string> {

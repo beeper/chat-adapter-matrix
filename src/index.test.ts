@@ -972,6 +972,62 @@ describe("MatrixAdapter", () => {
     });
   });
 
+  it("escapes HTML anchor text before re-emitting markdown links", async () => {
+    const fakeClient = makeClient();
+    fakeClient.fetchRoomEvent = vi.fn(async () =>
+      makeRawEvent({
+        event_id: "$escaped-link",
+        content: {
+          body: "literal [text](https://example.com)",
+          msgtype: MsgType.Text,
+          format: "org.matrix.custom.html",
+          formatted_body:
+            '<p><a href="https://example.com">Docs [v1] (draft) \\\\ notes</a></p>',
+        },
+      })
+    );
+
+    const adapter = await makeInitializedAdapter(fakeClient);
+    const message = await adapter.fetchMessage(
+      "matrix:!room%3Abeeper.com",
+      "$escaped-link"
+    );
+
+    expect(message).toBeTruthy();
+    expect(
+      stringifyMarkdown(requireValue(message, "escaped link message").formatted).trim()
+    ).toBe("\\[Docs [v1\\] (draft) \\\\\\ notes](https://example.com)");
+  });
+
+  it("ignores malformed matrix.to links instead of aborting formatted-body parsing", async () => {
+    const fakeClient = makeClient();
+    fakeClient.fetchRoomEvent = vi.fn(async () =>
+      makeRawEvent({
+        event_id: "$bad-matrix-to",
+        content: {
+          body: "Broken mention link",
+          msgtype: MsgType.Text,
+          format: "org.matrix.custom.html",
+          formatted_body:
+            '<p><a href="https://matrix.to/#/%E0%A4%A">broken]</a> <strong>still parsed</strong></p>',
+        },
+      })
+    );
+
+    const adapter = await makeInitializedAdapter(fakeClient);
+    const message = await adapter.fetchMessage(
+      "matrix:!room%3Abeeper.com",
+      "$bad-matrix-to"
+    );
+
+    expect(message).toBeTruthy();
+    expect(message?.text).toBe("broken] still parsed");
+    expect(
+      stringifyMarkdown(requireValue(message, "bad matrix.to message").formatted).trim()
+    ).toBe("[broken\\]](https://matrix.to/#/%E0%A4%A) **still parsed**");
+    expect(message?.isMention).toBe(false);
+  });
+
   it("strips Matrix reply fallback from plain body text", async () => {
     const fakeClient = makeClient();
     fakeClient.fetchRoomEvent = vi.fn(async () =>

@@ -140,11 +140,11 @@ type MatrixLoginResponse = {
 };
 
 function createE2EIndexedDBPrefix(session: MatrixLoginResponse): string {
-  return `matrix-chat-adapter-e2e-${sanitizeForIndexedDBName(session.userID)}-${sanitizeForIndexedDBName(session.deviceID)}`;
+  return `matrix-chat-adapter-e2e-${encodeForIndexedDBName(session.userID)}-${encodeForIndexedDBName(session.deviceID)}`;
 }
 
-function sanitizeForIndexedDBName(value: string): string {
-  return value.replace(/[^a-zA-Z0-9_-]+/gu, "_");
+function encodeForIndexedDBName(value: string): string {
+  return Buffer.from(value, "utf8").toString("base64url");
 }
 
 function generateDeviceID(): string {
@@ -301,8 +301,30 @@ export async function waitForCondition(
   const startedAt = Date.now();
 
   while (true) {
-    if (await condition()) {
-      return;
+    const remainingMs = timeoutMs - (Date.now() - startedAt);
+    if (remainingMs <= 0) {
+      throw new Error(`waitForCondition timed out after ${timeoutMs}ms`);
+    }
+
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const matched = await Promise.race([
+        Promise.resolve().then(condition),
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => {
+            reject(new Error(`waitForCondition timed out after ${timeoutMs}ms`));
+          }, remainingMs);
+          timeout.unref?.();
+        }),
+      ]);
+
+      if (matched) {
+        return;
+      }
+    } finally {
+      if (timeout) {
+        clearTimeout(timeout);
+      }
     }
 
     if (Date.now() - startedAt >= timeoutMs) {
