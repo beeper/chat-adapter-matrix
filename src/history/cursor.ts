@@ -32,6 +32,9 @@ export function decodeThreadId(threadId: string): MatrixThreadID {
   }
 
   const roomID = decodeURIComponent(parts[1]);
+  if (!roomID) {
+    throw new Error(`Invalid Matrix thread ID: ${threadId}`);
+  }
   const rootEventID = parts[2] ? decodeURIComponent(parts[2]) : undefined;
 
   return { roomID, rootEventID };

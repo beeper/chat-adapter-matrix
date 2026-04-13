@@ -450,6 +450,21 @@ describe("MatrixAdapter", () => {
     });
   });
 
+  it("rejects thread IDs with an empty room ID", () => {
+    const adapter = new MatrixAdapter({
+      baseURL: "https://hs.beeper.com",
+      auth: {
+        type: "accessToken",
+        accessToken: "token",
+        userID: "@bot:beeper.com",
+      },
+    });
+
+    expect(() => adapter.decodeThreadId("matrix:")).toThrow(
+      "Invalid Matrix thread ID: matrix:"
+    );
+  });
+
   it("parses slash commands from timeline messages", async () => {
     const fakeClient = makeClient();
 

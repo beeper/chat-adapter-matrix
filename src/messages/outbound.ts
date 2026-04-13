@@ -559,11 +559,11 @@ function findSplitBoundary(text: string, maxBytes: number): number {
   for (let i = best - 1; i > 0; i--) {
     const ch = text[i];
     if (ch === "\n" || ch === " " || ch === "\t" || ch === "\r") {
-      return i + 1;
+      return clampSurrogateBoundary(text, i + 1);
     }
   }
 
-  return best;
+  return clampSurrogateBoundary(text, best);
 }
 
 function trimEndPreservingSurrogates(text: string): string {
