@@ -1,6 +1,6 @@
 import type { ICreateClientOpts, IStartClientOpts, MatrixClient } from "matrix-js-sdk";
 import type { Logger, StateAdapter } from "chat";
-import type { IStore } from "matrix-js-sdk/lib/store";
+import type { IStore } from "matrix-js-sdk/lib/store/index.js";
 
 export interface MatrixE2EEConfig {
   cryptoDatabasePrefix?: string;

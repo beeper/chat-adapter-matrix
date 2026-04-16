@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Logger, StateAdapter } from "chat";
 import { createMemoryState } from "@chat-adapter/state-memory";
-import type { IStateEventWithRoomId } from "matrix-js-sdk/lib/@types/search";
-import type { IndexedToDeviceBatch } from "matrix-js-sdk/lib/models/ToDeviceMessage";
+import type { IStateEventWithRoomId } from "matrix-js-sdk/lib/@types/search.js";
+import type { IndexedToDeviceBatch } from "matrix-js-sdk/lib/models/ToDeviceMessage.js";
 import { ChatStateMatrixStore } from "./chat-state-matrix-store";
 
 function makeLogger(): Logger {

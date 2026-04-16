@@ -11,13 +11,13 @@ import {
   stringifyMarkdown,
 } from "chat";
 import { marked } from "marked";
-import { MatrixError } from "matrix-js-sdk/lib/http-api/errors";
+import { MatrixError } from "matrix-js-sdk/lib/http-api/errors.js";
 import { MsgType, RelationType } from "matrix-js-sdk";
 import type {
   RoomMessageEventContent,
   RoomMessageTextEventContent,
-} from "matrix-js-sdk/lib/@types/events";
-import type { MediaEventContent } from "matrix-js-sdk/lib/@types/media";
+} from "matrix-js-sdk/lib/@types/events.js";
+import type { MediaEventContent } from "matrix-js-sdk/lib/@types/media.js";
 import {
   escapeHTML,
   escapeMarkdownLinkText,
