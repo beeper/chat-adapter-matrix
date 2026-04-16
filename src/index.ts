@@ -42,14 +42,14 @@ import sdk, {
   ThreadFilterType,
   THREAD_RELATION_TYPE,
 } from "matrix-js-sdk";
-import type { IStore } from "matrix-js-sdk/lib/store";
+import type { IStore } from "matrix-js-sdk/lib/store/index.js";
 import type {
   RoomMessageEventContent,
-} from "matrix-js-sdk/lib/@types/events";
-import type { MediaEventContent } from "matrix-js-sdk/lib/@types/media";
-import { MatrixError } from "matrix-js-sdk/lib/http-api/errors";
-import { decodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key";
-import { logger as matrixSDKLogger } from "matrix-js-sdk/lib/logger";
+} from "matrix-js-sdk/lib/@types/events.js";
+import type { MediaEventContent } from "matrix-js-sdk/lib/@types/media.js";
+import { MatrixError } from "matrix-js-sdk/lib/http-api/errors.js";
+import { decodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key.js";
+import { logger as matrixSDKLogger } from "matrix-js-sdk/lib/logger.js";
 import {
   DEFAULT_COMMAND_PREFIX,
   FAST_SYNC_DEFAULTS,

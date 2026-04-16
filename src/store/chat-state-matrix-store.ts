@@ -1,14 +1,14 @@
 import type { Logger, StateAdapter } from "chat";
 import { MatrixEvent, type IStartClientOpts } from "matrix-js-sdk";
-import type { IEvent } from "matrix-js-sdk/lib/models/event";
+import type { IEvent } from "matrix-js-sdk/lib/models/event.js";
 import type {
   IndexedToDeviceBatch,
   ToDeviceBatchWithTxnId,
-} from "matrix-js-sdk/lib/models/ToDeviceMessage";
-import { SyncAccumulator, type ISyncResponse } from "matrix-js-sdk/lib/sync-accumulator";
-import type { IStateEventWithRoomId } from "matrix-js-sdk/lib/@types/search";
-import { MemoryStore } from "matrix-js-sdk/lib/store/memory";
-import type { ISavedSync } from "matrix-js-sdk/lib/store";
+} from "matrix-js-sdk/lib/models/ToDeviceMessage.js";
+import { SyncAccumulator, type ISyncResponse } from "matrix-js-sdk/lib/sync-accumulator.js";
+import type { IStateEventWithRoomId } from "matrix-js-sdk/lib/@types/search.js";
+import { MemoryStore } from "matrix-js-sdk/lib/store/memory.js";
+import type { ISavedSync } from "matrix-js-sdk/lib/store/index.js";
 
 const STORE_VERSION = 1;
 const DEFAULT_PERSIST_INTERVAL_MS = 30_000;
