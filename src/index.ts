@@ -1070,16 +1070,15 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   }
 
   private async primeDirectRoomIDs(): Promise<void> {
-    // Fail closed: cached m.direct data is safe to use immediately, and an
-    // unavailable homeserver must never make member count an implicit DM
-    // signal. loadDirectAccountData() fetches from the server when the cache is
-    // empty, which covers cold starts before the first sync/account-data event.
+    // Install cached m.direct data as a fallback, but always refresh it from the
+    // homeserver so warm starts cannot retain stale room classifications.
     this.replaceDirectRoomIDs(this.loadCachedDirectAccountData());
     try {
-      await this.loadDirectAccountData();
+      const direct = await this.requireClient().getAccountDataFromServer(EventType.Direct);
+      this.replaceDirectRoomIDs(this.normalizeDirectAccountData(direct));
     } catch (error) {
       this.logger.warn(
-        "Failed to prime Matrix direct rooms; treating unmarked rooms as channels",
+        "Failed to refresh Matrix direct rooms; retaining cached m.direct data and treating other rooms as channels",
         { error }
       );
     }

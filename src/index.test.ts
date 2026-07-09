@@ -524,6 +524,33 @@ describe("MatrixAdapter", () => {
     expect(adapter.isDM("matrix:!unmarked%3Abeeper.com")).toBe(false);
   });
 
+  it("refreshes stale cached m.direct data during initialization", async () => {
+    const client = makeClient();
+    client.getAccountData.mockReturnValue({
+      getContent: () => ({
+        "@alice:beeper.com": ["!stale-direct:beeper.com"],
+      }),
+    });
+    client.getAccountDataFromServer.mockResolvedValue({
+      "@alice:beeper.com": ["!fresh-direct:beeper.com"],
+    });
+    const adapter = createMatrixAdapter({
+      baseURL: "https://matrix.example.com",
+      auth: {
+        type: "accessToken",
+        accessToken: "token",
+        userID: "@bot:beeper.com",
+      },
+      createClient: () => asMatrixClient(client),
+    });
+
+    await adapter.initialize(makeChatInstance());
+
+    expect(client.getAccountDataFromServer).toHaveBeenCalledWith(EventType.Direct);
+    expect(adapter.isDM("matrix:!stale-direct%3Abeeper.com")).toBe(false);
+    expect(adapter.isDM("matrix:!fresh-direct%3Abeeper.com")).toBe(true);
+  });
+
   it("rejects thread IDs with an empty room ID", () => {
     const adapter = new MatrixAdapter({
       baseURL: "https://hs.beeper.com",
