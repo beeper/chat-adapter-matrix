@@ -2,7 +2,13 @@ import { describe, expect, it, vi } from "vitest";
 import { Chat, getEmoji, stringifyMarkdown } from "chat";
 import type { AdapterPostableMessage, ChatInstance, Logger, StateAdapter } from "chat";
 import { createMemoryState } from "@chat-adapter/state-memory";
-import { EventType, MsgType, RelationType, type MatrixClient } from "matrix-js-sdk";
+import {
+  ClientEvent,
+  EventType,
+  MsgType,
+  RelationType,
+  type MatrixClient,
+} from "matrix-js-sdk";
 import { MatrixError } from "matrix-js-sdk/lib/http-api/errors";
 import { encodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key";
 import { createMatrixAdapter, MatrixAdapter } from "./index";
@@ -224,6 +230,10 @@ function makeClient() {
     fetchRoomEvent: vi.fn(async (): Promise<RawEventLike | null> => null),
     getAccountDataFromServer: vi.fn(
       async (): Promise<Record<string, string[]> | null> => null
+    ),
+    getAccountData: vi.fn(
+      (_type: string): { getContent: () => Record<string, string[]> } | undefined =>
+        undefined
     ),
     getAccessToken: vi.fn(() => "token"),
     getCrypto: vi.fn(() => crypto),
@@ -455,6 +465,90 @@ describe("MatrixAdapter", () => {
       roomID: "!room:beeper.com",
       rootEventID: "$root:beeper.com",
     });
+  });
+
+  it("classifies only m.direct rooms as DMs and refreshes the synchronous cache", async () => {
+    const client = makeClient();
+    client.getAccountDataFromServer.mockResolvedValue({
+      "@alice:beeper.com": ["!direct:beeper.com"],
+    });
+    const adapter = createMatrixAdapter({
+      baseURL: "https://matrix.example.com",
+      auth: {
+        type: "accessToken",
+        accessToken: "token",
+        userID: "@bot:beeper.com",
+      },
+      createClient: () => asMatrixClient(client),
+    });
+
+    await adapter.initialize(makeChatInstance());
+
+    expect(client.getAccountDataFromServer).toHaveBeenCalledWith(EventType.Direct);
+    expect(adapter.isDM("matrix:!direct%3Abeeper.com")).toBe(true);
+    // A two-person room is still a normal room unless m.direct marks it.
+    expect(adapter.isDM("matrix:!unmarked-two-person%3Abeeper.com")).toBe(false);
+    expect(adapter.isDM("not-a-matrix-thread")).toBe(false);
+
+    const newDirectThread = await adapter.openDM("@dave:beeper.com");
+    expect(adapter.isDM(newDirectThread)).toBe(true);
+
+    client.__handlers.get(ClientEvent.AccountData)?.(
+      makeEvent({
+        getType: () => EventType.Direct,
+        getContent: () => ({
+          "@erin:beeper.com": ["!updated-direct:beeper.com"],
+        }),
+      })
+    );
+    expect(adapter.isDM("matrix:!direct%3Abeeper.com")).toBe(false);
+    expect(adapter.isDM("matrix:!updated-direct%3Abeeper.com")).toBe(true);
+  });
+
+  it("fails closed when cold-start m.direct priming is unavailable", async () => {
+    const client = makeClient();
+    client.getAccountDataFromServer.mockRejectedValue(new Error("homeserver unavailable"));
+    const adapter = createMatrixAdapter({
+      baseURL: "https://matrix.example.com",
+      auth: {
+        type: "accessToken",
+        accessToken: "token",
+        userID: "@bot:beeper.com",
+      },
+      createClient: () => asMatrixClient(client),
+    });
+
+    await expect(adapter.initialize(makeChatInstance())).resolves.toBeUndefined();
+
+    expect(client.startClient).toHaveBeenCalledOnce();
+    expect(adapter.isDM("matrix:!unmarked%3Abeeper.com")).toBe(false);
+  });
+
+  it("refreshes stale cached m.direct data during initialization", async () => {
+    const client = makeClient();
+    client.getAccountData.mockReturnValue({
+      getContent: () => ({
+        "@alice:beeper.com": ["!stale-direct:beeper.com"],
+      }),
+    });
+    client.getAccountDataFromServer.mockResolvedValue({
+      "@alice:beeper.com": ["!fresh-direct:beeper.com"],
+    });
+    const adapter = createMatrixAdapter({
+      baseURL: "https://matrix.example.com",
+      auth: {
+        type: "accessToken",
+        accessToken: "token",
+        userID: "@bot:beeper.com",
+      },
+      createClient: () => asMatrixClient(client),
+    });
+
+    await adapter.initialize(makeChatInstance());
+
+    expect(client.getAccountDataFromServer).toHaveBeenCalledWith(EventType.Direct);
+    expect(adapter.isDM("matrix:!stale-direct%3Abeeper.com")).toBe(false);
+    expect(adapter.isDM("matrix:!fresh-direct%3Abeeper.com")).toBe(true);
   });
 
   it("rejects thread IDs with an empty room ID", () => {
@@ -2676,12 +2770,7 @@ describe("MatrixAdapter", () => {
 
   it("merges fresh m.direct account data before persisting a newly created DM", async () => {
     const fakeClient = makeClient();
-    fakeClient.getAccountDataFromServer
-      .mockResolvedValueOnce({})
-      .mockResolvedValueOnce({
-        "@bob:beeper.com": ["!existing-dm:beeper.com"],
-        "@carol:beeper.com": ["!carol-dm:beeper.com"],
-      });
+    fakeClient.getAccountDataFromServer.mockResolvedValue({});
     fakeClient.createRoom.mockResolvedValue({ room_id: "!new-dm:beeper.com" });
 
     const adapter = new MatrixAdapter({
@@ -2691,6 +2780,12 @@ describe("MatrixAdapter", () => {
     });
 
     await adapter.initialize(makeChatInstance({ state: makeStateAdapter() }));
+    fakeClient.getAccountDataFromServer
+      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({
+        "@bob:beeper.com": ["!existing-dm:beeper.com"],
+        "@carol:beeper.com": ["!carol-dm:beeper.com"],
+      });
     await adapter.openDM("@bob:beeper.com");
 
     expect(fakeClient.setAccountData).toHaveBeenCalledWith(EventType.Direct, {
