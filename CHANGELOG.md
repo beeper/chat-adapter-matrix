@@ -12,6 +12,7 @@
 - Attachments sent alongside text no longer incorrectly carry the reply-to relationship
 - Incoming formatted messages were parsed twice; removed redundant `<mx-reply>` pre-strip pass
 - `matrixSDKLogConfigured` flag no longer latches when `setLevel` is missing from the SDK logger
+- Chat SDK now classifies `m.direct` and authoritative two-person rooms as direct messages
 
 ### Changes
 

@@ -2,7 +2,14 @@ import { describe, expect, it, vi } from "vitest";
 import { Chat, getEmoji, stringifyMarkdown } from "chat";
 import type { AdapterPostableMessage, ChatInstance, Logger, StateAdapter } from "chat";
 import { createMemoryState } from "@chat-adapter/state-memory";
-import { EventType, MsgType, RelationType, type MatrixClient } from "matrix-js-sdk";
+import {
+  ClientEvent,
+  EventType,
+  MsgType,
+  RelationType,
+  RoomMemberEvent,
+  type MatrixClient,
+} from "matrix-js-sdk";
 import { MatrixError } from "matrix-js-sdk/lib/http-api/errors";
 import { encodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key";
 import { createMatrixAdapter, MatrixAdapter } from "./index";
@@ -224,6 +231,18 @@ function makeClient() {
     fetchRoomEvent: vi.fn(async (): Promise<RawEventLike | null> => null),
     getAccountDataFromServer: vi.fn(
       async (): Promise<Record<string, string[]> | null> => null
+    ),
+    getAccountData: vi.fn(
+      (_type: string): { getContent: () => Record<string, string[]> } | undefined =>
+        undefined
+    ),
+    getJoinedRooms: vi.fn(
+      async (): Promise<{ joined_rooms: string[] }> => ({ joined_rooms: [] })
+    ),
+    getJoinedRoomMembers: vi.fn(
+      async (_roomID: string): Promise<{ joined: Record<string, unknown> }> => ({
+        joined: {},
+      })
     ),
     getAccessToken: vi.fn(() => "token"),
     getCrypto: vi.fn(() => crypto),
@@ -454,6 +473,76 @@ describe("MatrixAdapter", () => {
     expect(adapter.decodeThreadId(encoded)).toEqual({
       roomID: "!room:beeper.com",
       rootEventID: "$root:beeper.com",
+    });
+  });
+
+  it("classifies m.direct and authoritative two-person rooms as DMs", async () => {
+    const client = makeClient();
+    client.getAccountData.mockReturnValue({
+      getContent: () => ({
+        "@alice:beeper.com": ["!direct:beeper.com"],
+      }),
+    });
+    client.getJoinedRooms.mockResolvedValue({
+      joined_rooms: ["!named:beeper.com", "!group:beeper.com"],
+    });
+    client.getJoinedRoomMembers.mockImplementation(async (roomID: string) => ({
+      joined:
+        roomID === "!named:beeper.com"
+          ? {
+              "@bot:beeper.com": {},
+              "@bob:beeper.com": {},
+            }
+          : {
+              "@bot:beeper.com": {},
+              "@bob:beeper.com": {},
+              "@carol:beeper.com": {},
+            },
+    }));
+    const adapter = createMatrixAdapter({
+      baseURL: "https://matrix.example.com",
+      auth: {
+        type: "accessToken",
+        accessToken: "token",
+        userID: "@bot:beeper.com",
+      },
+      createClient: () => asMatrixClient(client),
+    });
+
+    await adapter.initialize(makeChatInstance());
+
+    expect(adapter.isDM("matrix:!direct%3Abeeper.com")).toBe(true);
+    expect(adapter.isDM("matrix:!named%3Abeeper.com")).toBe(true);
+    expect(adapter.isDM("matrix:!group%3Abeeper.com")).toBe(false);
+    expect(adapter.isDM("not-a-matrix-thread")).toBe(false);
+
+    const newDirectThread = await adapter.openDM("@dave:beeper.com");
+    expect(adapter.isDM(newDirectThread)).toBe(true);
+
+    client.__handlers.get(ClientEvent.AccountData)?.(
+      makeEvent({
+        getType: () => EventType.Direct,
+        getContent: () => ({
+          "@erin:beeper.com": ["!updated-direct:beeper.com"],
+        }),
+      })
+    );
+    expect(adapter.isDM("matrix:!direct%3Abeeper.com")).toBe(false);
+    expect(adapter.isDM("matrix:!updated-direct%3Abeeper.com")).toBe(true);
+
+    client.getJoinedRoomMembers.mockResolvedValue({
+      joined: {
+        "@bot:beeper.com": {},
+        "@bob:beeper.com": {},
+        "@carol:beeper.com": {},
+      },
+    });
+    client.__handlers.get(RoomMemberEvent.Membership)?.(
+      makeEvent(),
+      { roomId: "!named:beeper.com" }
+    );
+    await vi.waitFor(() => {
+      expect(adapter.isDM("matrix:!named%3Abeeper.com")).toBe(false);
     });
   });
 

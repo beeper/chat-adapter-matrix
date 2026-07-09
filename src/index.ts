@@ -38,6 +38,7 @@ import sdk, {
   MsgType,
   RelationType,
   RoomEvent,
+  RoomMemberEvent,
   SyncState,
   ThreadFilterType,
   THREAD_RELATION_TYPE,
@@ -208,6 +209,8 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   private readonly reactionByEventID = new Map<string, StoredReaction>();
   private readonly myReactionByKey = new Map<string, string>();
   private readonly processedTimelineEventIDs = new Set<string>();
+  private readonly directRoomIDs = new Set<string>();
+  private readonly twoPersonRoomIDs = new Set<string>();
   private lastSecretsBundlePersistAt = 0;
   private secretsBundleUnavailableLogged = false;
   private liveSyncReady = false;
@@ -294,8 +297,18 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       }
       this.dispatchTimelineEvent(event, undefined, false);
     });
+    this.client.on(ClientEvent.AccountData, (event) => {
+      if (event.getType() === EventType.Direct) {
+        this.replaceDirectRoomIDs(this.normalizeDirectAccountData(event.getContent()));
+      }
+    });
+    this.client.on(RoomMemberEvent.Membership, (_event, member) => {
+      this.twoPersonRoomIDs.delete(member.roomId);
+      void this.refreshTwoPersonRoom(member.roomId);
+    });
 
     await this.maybeInitE2EE();
+    await this.primeDMRoomIDs();
     await this.client.startClient(this.syncOptions);
     this.started = true;
 
@@ -322,6 +335,8 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
       this.client.stopClient();
       this.reactionByEventID.clear();
       this.myReactionByKey.clear();
+      this.directRoomIDs.clear();
+      this.twoPersonRoomIDs.clear();
       this.client = null;
       this.started = false;
       this.logger.info("Matrix adapter shutdown complete");
@@ -350,6 +365,15 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
 
   channelIdFromThreadId(threadId: string): string {
     return channelIdFromThreadId(threadId);
+  }
+
+  isDM(threadId: string): boolean {
+    try {
+      const { roomID } = this.decodeThreadId(threadId);
+      return this.directRoomIDs.has(roomID) || this.twoPersonRoomIDs.has(roomID);
+    } catch {
+      return false;
+    }
   }
 
   renderFormatted(content: FormattedContent): string {
@@ -1042,11 +1066,69 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
   private async loadDirectAccountData(): Promise<DirectAccountData> {
     const cached = this.loadCachedDirectAccountData();
     if (Object.keys(cached).length > 0) {
+      this.replaceDirectRoomIDs(cached);
       return cached;
     }
 
     const direct = await this.requireClient().getAccountDataFromServer(EventType.Direct);
-    return this.normalizeDirectAccountData(direct);
+    const normalized = this.normalizeDirectAccountData(direct);
+    this.replaceDirectRoomIDs(normalized);
+    return normalized;
+  }
+
+  private async primeDMRoomIDs(): Promise<void> {
+    this.replaceDirectRoomIDs(this.loadCachedDirectAccountData());
+    await this.refreshTwoPersonRoomIDs();
+  }
+
+  private replaceDirectRoomIDs(direct: DirectAccountData): void {
+    this.directRoomIDs.clear();
+    for (const roomIDs of Object.values(direct)) {
+      for (const roomID of roomIDs) {
+        this.directRoomIDs.add(roomID);
+      }
+    }
+  }
+
+  private async refreshTwoPersonRoomIDs(): Promise<void> {
+    let roomIDs: string[];
+    try {
+      const response = await this.requireClient().getJoinedRooms();
+      roomIDs = response.joined_rooms;
+    } catch (error) {
+      this.logger.debug("Failed to list joined Matrix rooms for DM detection", {
+        error,
+      });
+      return;
+    }
+
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      while (next < roomIDs.length) {
+        const roomID = roomIDs[next++];
+        await this.refreshTwoPersonRoom(roomID);
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(4, roomIDs.length) }, () => worker())
+    );
+  }
+
+  private async refreshTwoPersonRoom(roomID: string): Promise<void> {
+    try {
+      const response = await this.requireClient().getJoinedRoomMembers(roomID);
+      if (Object.keys(response.joined).length === 2) {
+        this.twoPersonRoomIDs.add(roomID);
+      } else {
+        this.twoPersonRoomIDs.delete(roomID);
+      }
+    } catch (error) {
+      this.twoPersonRoomIDs.delete(roomID);
+      this.logger.debug("Failed to refresh Matrix room members for DM detection", {
+        roomId: roomID,
+        error,
+      });
+    }
   }
 
   private loadCachedDirectAccountData(): DirectAccountData {
@@ -1140,6 +1222,7 @@ export class MatrixAdapter implements Adapter<MatrixThreadID, MatrixEvent> {
         [userID]: [...existingRooms, roomID],
       };
       await this.requireClient().setAccountData(EventType.Direct, updated);
+      this.directRoomIDs.add(roomID);
     }
   }
 
