@@ -7,7 +7,6 @@ import {
   EventType,
   MsgType,
   RelationType,
-  RoomMemberEvent,
   type MatrixClient,
 } from "matrix-js-sdk";
 import { MatrixError } from "matrix-js-sdk/lib/http-api/errors";
@@ -235,14 +234,6 @@ function makeClient() {
     getAccountData: vi.fn(
       (_type: string): { getContent: () => Record<string, string[]> } | undefined =>
         undefined
-    ),
-    getJoinedRooms: vi.fn(
-      async (): Promise<{ joined_rooms: string[] }> => ({ joined_rooms: [] })
-    ),
-    getJoinedRoomMembers: vi.fn(
-      async (_roomID: string): Promise<{ joined: Record<string, unknown> }> => ({
-        joined: {},
-      })
     ),
     getAccessToken: vi.fn(() => "token"),
     getCrypto: vi.fn(() => crypto),
@@ -476,29 +467,11 @@ describe("MatrixAdapter", () => {
     });
   });
 
-  it("classifies m.direct and authoritative two-person rooms as DMs", async () => {
+  it("classifies only m.direct rooms as DMs and refreshes the synchronous cache", async () => {
     const client = makeClient();
-    client.getAccountData.mockReturnValue({
-      getContent: () => ({
-        "@alice:beeper.com": ["!direct:beeper.com"],
-      }),
+    client.getAccountDataFromServer.mockResolvedValue({
+      "@alice:beeper.com": ["!direct:beeper.com"],
     });
-    client.getJoinedRooms.mockResolvedValue({
-      joined_rooms: ["!named:beeper.com", "!group:beeper.com"],
-    });
-    client.getJoinedRoomMembers.mockImplementation(async (roomID: string) => ({
-      joined:
-        roomID === "!named:beeper.com"
-          ? {
-              "@bot:beeper.com": {},
-              "@bob:beeper.com": {},
-            }
-          : {
-              "@bot:beeper.com": {},
-              "@bob:beeper.com": {},
-              "@carol:beeper.com": {},
-            },
-    }));
     const adapter = createMatrixAdapter({
       baseURL: "https://matrix.example.com",
       auth: {
@@ -511,9 +484,10 @@ describe("MatrixAdapter", () => {
 
     await adapter.initialize(makeChatInstance());
 
+    expect(client.getAccountDataFromServer).toHaveBeenCalledWith(EventType.Direct);
     expect(adapter.isDM("matrix:!direct%3Abeeper.com")).toBe(true);
-    expect(adapter.isDM("matrix:!named%3Abeeper.com")).toBe(true);
-    expect(adapter.isDM("matrix:!group%3Abeeper.com")).toBe(false);
+    // A two-person room is still a normal room unless m.direct marks it.
+    expect(adapter.isDM("matrix:!unmarked-two-person%3Abeeper.com")).toBe(false);
     expect(adapter.isDM("not-a-matrix-thread")).toBe(false);
 
     const newDirectThread = await adapter.openDM("@dave:beeper.com");
@@ -529,21 +503,25 @@ describe("MatrixAdapter", () => {
     );
     expect(adapter.isDM("matrix:!direct%3Abeeper.com")).toBe(false);
     expect(adapter.isDM("matrix:!updated-direct%3Abeeper.com")).toBe(true);
+  });
 
-    client.getJoinedRoomMembers.mockResolvedValue({
-      joined: {
-        "@bot:beeper.com": {},
-        "@bob:beeper.com": {},
-        "@carol:beeper.com": {},
+  it("fails closed when cold-start m.direct priming is unavailable", async () => {
+    const client = makeClient();
+    client.getAccountDataFromServer.mockRejectedValue(new Error("homeserver unavailable"));
+    const adapter = createMatrixAdapter({
+      baseURL: "https://matrix.example.com",
+      auth: {
+        type: "accessToken",
+        accessToken: "token",
+        userID: "@bot:beeper.com",
       },
+      createClient: () => asMatrixClient(client),
     });
-    client.__handlers.get(RoomMemberEvent.Membership)?.(
-      makeEvent(),
-      { roomId: "!named:beeper.com" }
-    );
-    await vi.waitFor(() => {
-      expect(adapter.isDM("matrix:!named%3Abeeper.com")).toBe(false);
-    });
+
+    await expect(adapter.initialize(makeChatInstance())).resolves.toBeUndefined();
+
+    expect(client.startClient).toHaveBeenCalledOnce();
+    expect(adapter.isDM("matrix:!unmarked%3Abeeper.com")).toBe(false);
   });
 
   it("rejects thread IDs with an empty room ID", () => {
@@ -2765,12 +2743,7 @@ describe("MatrixAdapter", () => {
 
   it("merges fresh m.direct account data before persisting a newly created DM", async () => {
     const fakeClient = makeClient();
-    fakeClient.getAccountDataFromServer
-      .mockResolvedValueOnce({})
-      .mockResolvedValueOnce({
-        "@bob:beeper.com": ["!existing-dm:beeper.com"],
-        "@carol:beeper.com": ["!carol-dm:beeper.com"],
-      });
+    fakeClient.getAccountDataFromServer.mockResolvedValue({});
     fakeClient.createRoom.mockResolvedValue({ room_id: "!new-dm:beeper.com" });
 
     const adapter = new MatrixAdapter({
@@ -2780,6 +2753,12 @@ describe("MatrixAdapter", () => {
     });
 
     await adapter.initialize(makeChatInstance({ state: makeStateAdapter() }));
+    fakeClient.getAccountDataFromServer
+      .mockResolvedValueOnce({})
+      .mockResolvedValueOnce({
+        "@bob:beeper.com": ["!existing-dm:beeper.com"],
+        "@carol:beeper.com": ["!carol-dm:beeper.com"],
+      });
     await adapter.openDM("@bob:beeper.com");
 
     expect(fakeClient.setAccountData).toHaveBeenCalledWith(EventType.Direct, {
